@@ -1,9 +1,7 @@
-use allocator_api2::{
-    alloc::{self, handle_alloc_error},
-    boxed::Box,
-};
-use core::{alloc::Layout, fmt::Debug, marker::Unsize, mem::take};
 use crate::Ref;
+use crate::alloc::{self, handle_alloc_error};
+use crate::boxed::Box;
+use core::{alloc::Layout, fmt::Debug, marker::Unsize, mem::take};
 
 type Link<'a, T> = Option<Ref<'a, Node<'a, T>>>;
 
@@ -53,7 +51,7 @@ impl<'a, T: ?Sized + 'a> List<'a, T> {
     {
         self.length += 1;
         Self {
-            head: Some(Ref::Owned(Box::new(Node {
+            head: Some(Ref::Boxed(Box::new(Node {
                 value,
                 next: self.head,
             }))),
@@ -64,7 +62,7 @@ impl<'a, T: ?Sized + 'a> List<'a, T> {
     pub fn prepend_sized<U: Unsize<T>>(mut self, value: U) -> Self {
         self.length += 1;
         Self {
-            head: Some(Ref::Owned(Node::init(self.head, value))),
+            head: Some(Ref::Boxed(Node::init(self.head, value))),
             ..self
         }
     }
@@ -89,7 +87,7 @@ impl<'a, T: ?Sized + 'a> List<'a, T> {
             let old_last_next = unsafe { (&raw mut (*last_node).next) };
             last_node = new_last.as_mut() as *mut Node<'a, T>;
             unsafe {
-                old_last_next.write(Some(Ref::Owned(new_last)));
+                old_last_next.write(Some(Ref::Boxed(new_last)));
             }
         }
         result
@@ -101,7 +99,7 @@ impl<'a, T: ?Sized + 'a> List<'a, T> {
         };
         self.length -= 1;
         self.head = match self.head.unwrap() {
-            Ref::Owned(mut node) => node.next.take(),
+            Ref::Boxed(mut node) => node.next.take(),
             Ref::Borrowed(node) => node.next.as_deref().map(Ref::Borrowed),
         };
         self
@@ -113,7 +111,7 @@ impl<'a, T: ?Sized + 'a> List<'a, T> {
         };
         self.length -= 1;
         let val = match self.head.unwrap() {
-            Ref::Owned(_) => {
+            Ref::Boxed(_) => {
                 todo!()
                 // self.head = node.next.take();
                 // let node = Box::into_raw(node);
@@ -203,7 +201,7 @@ impl<'a, T> FromIterator<T> for List<'a, T> {
             let old_last_next = unsafe { (&raw mut (*last_node).next) };
             last_node = new_last.as_mut() as *mut Node<'a, T>;
             unsafe {
-                old_last_next.write(Some(Ref::Owned(new_last)));
+                old_last_next.write(Some(Ref::Boxed(new_last)));
             }
         }
         result
@@ -230,3 +228,89 @@ where
     }
 }
 impl<'a, T: ?Sized> ExactSizeIterator for Iter<'a, T> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::fmt::Debug;
+
+    #[test]
+    fn it_works() {
+        let new: List<char> = List::new();
+        let new = new.prepend('b');
+
+        let first = new.first();
+        assert_eq!(first, Some(&'b'))
+    }
+    #[test]
+    fn iterate() {
+        let new = List::new();
+        let new = new.prepend('!');
+        let new = new.prepend('d');
+        let new = new.prepend('l');
+        let new = new.prepend('r');
+        let new = new.prepend('o');
+        let new = new.prepend('W');
+
+        for (c1, c2) in new.iter().zip("World!".chars()) {
+            assert_eq!(*c1, c2);
+        }
+    }
+    #[test]
+    fn from_iter() {
+        let range = 0..10;
+        let mut new = List::from_iter(range.clone());
+
+        let mut range = range;
+        while let Some(head) = new.first() {
+            assert_eq!(*head, range.next().unwrap());
+            new = new.pop_front();
+        }
+    }
+    #[test]
+    fn from_iter_to_iter() {
+        let new = List::from_iter(0..10);
+
+        let mut sum = 0;
+        for (_, n) in new.iter().zip(core::iter::repeat(4)) {
+            sum += n;
+        }
+        assert_eq!(sum, 40);
+    }
+    #[test]
+    fn unsized_slice_tests() {
+        let new: List<[i32]> = List::new();
+        let new = new.prepend_sized([1, 1, 1]);
+        let new = new.prepend_sized([2]);
+        let new = new.prepend_sized([3; 76]);
+
+        let iterator = new.iter();
+        let new = new.reborrow();
+
+        assert_eq!(new.first(), Some([3i32; 76].as_slice()));
+        let new = new.pop_front();
+        assert_eq!(new.first(), Some([2].as_slice()));
+        let new = new.pop_front();
+        assert_eq!(new.first(), Some([1, 1, 1].as_slice()));
+
+        let mut sum = 0;
+        for i in iterator.map(<[i32]>::iter).flatten() {
+            sum += i;
+        }
+        assert_eq!(sum, 3 * 76 + 2 + 3 * 1);
+    }
+    #[test]
+    fn dyn_test() {
+        let new: List<dyn Debug> =
+            List::from_iter_sized((0..5).map(|x| char::from_digit(x, 10).unwrap()));
+        let new = new.prepend_sized("balls");
+        let new = new.prepend_sized(0);
+        let new = new.prepend_sized(core::f32::consts::PI);
+
+        let mut sum = String::new();
+        for i in new.iter() {
+            sum += &format!("{i:.2?}");
+        }
+        assert_eq!(&sum, "3.140\"balls\"'0''1''2''3''4'");
+    }
+}

@@ -1,29 +1,57 @@
+#![expect(incomplete_features)]
 #![feature(set_ptr_value)]
 #![feature(layout_for_ptr)]
 #![feature(unsize)]
-#![cfg_attr(not(test), no_std)]
-pub mod list;
-pub mod vector;
+#![feature(maybe_uninit_slice)]
+#![feature(generic_const_exprs)]
+#![feature(box_into_inner)]
+#![cfg_attr(not(any(test, feature = "std")), no_std)]
+// #![no_std]
+#![cfg_attr(not(feature = "allocator-api2"), feature(allocator_api))]
 
-use allocator_api2::boxed::Box;
-use core::{mem::ManuallyDrop, ops::Deref};
+mod list;
+mod vector;
+
+pub use list::List;
+pub use vector::PersVector;
+
+cfg_if::cfg_if! {
+    if #[cfg(feature = "allocator-api2")] {
+        pub(crate) use allocator_api2::alloc;
+        pub(crate) use allocator_api2::boxed;
+        use allocator_api2::alloc::Allocator;
+        use allocator_api2::boxed::Box;
+    } else if #[cfg(feature = "std")] {
+        pub(crate) use std::alloc;
+        pub(crate) use std::boxed;
+        use std::alloc::Allocator;
+        use std::boxed::Box;
+    } else {
+        extern crate alloc as mem;
+        pub(crate) use mem::alloc;
+        pub(crate) use mem::boxed;
+        use mem::alloc::Allocator;
+        use mem::boxed::Box;
+    }
+}
+use core::{ops::Deref, ptr::NonNull};
 #[derive(Debug, Clone)]
 enum Ref<'a, T: ?Sized> {
-    Owned(Box<T>),
+    Boxed(Box<T>),
     Borrowed(&'a T),
 }
 impl<'a, T: ?Sized> Ref<'a, T> {
     // For when we know we are holding a reference to a value that isnt owned
     fn ref_unchecked(self) -> &'a T {
         match self {
-            Self::Owned(_) => unreachable!(),
+            Self::Boxed(_) => unreachable!(),
             Self::Borrowed(t) => t,
         }
     }
     // For when we know we are owning a value we want to mutate
     fn mut_unchecked(&mut self) -> &mut T {
         match self {
-            Self::Owned(t) => t.as_mut(),
+            Self::Boxed(t) => t.as_mut(),
             Self::Borrowed(_) => unreachable!(),
         }
     }
@@ -33,7 +61,7 @@ impl<'a, T: ?Sized> Deref for Ref<'a, T> {
 
     fn deref(&self) -> &Self::Target {
         match self {
-            Self::Owned(bt) => bt.deref(),
+            Self::Boxed(bt) => bt.deref(),
             Self::Borrowed(t) => t,
         }
     }
@@ -48,121 +76,65 @@ where
     }
 }
 union UnsafeRef<'a, T: ?Sized> {
-    boxed: ManuallyDrop<Box<T>>,
+    boxed: NonNull<T>,
     borrowed: &'a T,
 }
 impl<'a, T: ?Sized> UnsafeRef<'a, T> {
-    pub fn from_ref(val: &'a T) -> Self {
-        UnsafeRef {
-            borrowed: val
+    cfg_if::cfg_if! {
+    if #[cfg(feature = "allocator-api2")] {
+        pub fn from_box<A: Allocator>(val: Box<T, A>) -> Self {
+            UnsafeRef {
+                boxed: Box::<T, A>::into_non_null(val).0
+            }
+        }
+    } else {
+        pub fn from_box<A: Allocator>(val: Box<T, A>) -> Self {
+            UnsafeRef {
+                boxed: Box::<T, A>::into_non_null_with_allocator(val).0
+            }
         }
     }
-    pub fn from_box(val: Box<T>) -> Self {
-        UnsafeRef {
-            boxed: ManuallyDrop::new(val)
-        }
     }
 }
-impl<'a, T: ?Sized> Deref for UnsafeRef<'a, T> {
-    type Target = T;
-    fn deref(&self) -> &Self::Target {
-        unsafe { self.borrowed }
-    }
+pub const fn bytes(n: usize) -> usize {
+    n.div_ceil(8)
 }
-impl<'a, T> AsRef<T> for UnsafeRef<'a, T>
+pub struct BitArray<const N: usize>([u8; bytes(N)])
 where
-    T: ?Sized,
-    <UnsafeRef<'a, T> as Deref>::Target: AsRef<T>,
+    [(); bytes(N)]:;
+impl<const N: usize> BitArray<N>
+where
+    [(); bytes(N)]:,
 {
-    fn as_ref(&self) -> &T {
-        self.deref()
+    pub const fn new() -> Self {
+        Self([0; _])
     }
-}
-
-
-// TODO more tests
-#[cfg(test)]
-mod tests {
-    use super::list::*;
-    use std::fmt::Debug;
-
-    #[test]
-    fn it_works() {
-        let new: List<char> = List::new();
-        let new = new.prepend('b');
-
-        let first = new.first();
-        assert_eq!(first, Some(&'b'))
+    pub fn get(&self, idx: usize) -> bool {
+        assert!(idx < N);
+        let byte_idx = idx / 8;
+        let bit_idx = idx % 8;
+        let mask = 1 << bit_idx;
+        mask & self.0[byte_idx] != 0
     }
-    #[test]
-    fn iterate() {
-        let new = List::new();
-        let new = new.prepend('!');
-        let new = new.prepend('d');
-        let new = new.prepend('l');
-        let new = new.prepend('r');
-        let new = new.prepend('o');
-        let new = new.prepend('W');
-
-        for (c1, c2) in new.iter().zip("World!".chars()) {
-            assert_eq!(*c1, c2);
-        }
+    pub fn set(&mut self, idx: usize) {
+        assert!(idx < N);
+        let byte_idx = idx / 8;
+        let bit_idx = idx % 8;
+        let mask = 1 << bit_idx;
+        self.0[byte_idx] |= mask;
     }
-    #[test]
-    fn from_iter() {
-        let range = 0..10;
-        let mut new = List::from_iter(range.clone());
-
-        let mut range = range;
-        while let Some(head) = new.first() {
-            assert_eq!(*head, range.next().unwrap());
-            new = new.pop_front();
-        }
+    pub fn unset(&mut self, idx: usize) {
+        assert!(idx < N);
+        let byte_idx = idx / 8;
+        let bit_idx = idx % 8;
+        let mask = 1 << bit_idx;
+        self.0[byte_idx] &= !mask;
     }
-    #[test]
-    fn from_iter_to_iter() {
-        let new = List::from_iter(0..10);
-
-        let mut sum = 0;
-        for (_, n) in new.iter().zip(core::iter::repeat(4)) {
-            sum += n;
-        }
-        assert_eq!(sum, 40);
-    }
-    #[test]
-    fn unsized_slice_tests() {
-        let new: List<[i32]> = List::new();
-        let new = new.prepend_sized([1, 1, 1]);
-        let new = new.prepend_sized([2]);
-        let new = new.prepend_sized([3; 76]);
-
-        let iterator = new.iter();
-        let new = new.reborrow();
-
-        assert_eq!(new.first(), Some([3i32; 76].as_slice()));
-        let new = new.pop_front();
-        assert_eq!(new.first(), Some([2].as_slice()));
-        let new = new.pop_front();
-        assert_eq!(new.first(), Some([1, 1, 1].as_slice()));
-
-        let mut sum = 0;
-        for i in iterator.map(<[i32]>::iter).flatten() {
-            sum += i;
-        }
-        assert_eq!(sum, 3 * 76 + 2 + 3 * 1);
-    }
-    #[test]
-    fn dyn_test() {
-        let new: List<dyn Debug> =
-            List::from_iter_sized((0..5).map(|x| char::from_digit(x, 10).unwrap()));
-        let new = new.prepend_sized("balls");
-        let new = new.prepend_sized(0);
-        let new = new.prepend_sized(core::f32::consts::PI);
-
-        let mut sum = String::new();
-        for i in new.iter() {
-            sum += &format!("{i:.2?}");
-        }
-        assert_eq!(&sum, "3.140\"balls\"'0''1''2''3''4'");
+    pub fn toggle(&mut self, idx: usize) {
+        assert!(idx < N);
+        let byte_idx = idx / 8;
+        let bit_idx = idx % 8;
+        let mask = 1 << bit_idx;
+        self.0[byte_idx] ^= mask;
     }
 }
