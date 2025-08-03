@@ -2,23 +2,23 @@
 /// for when you want to create new, owned values, while using
 /// something else as a base to build off of.
 pub trait PartialClone {
-    /// Item should be Self, but currently this can't be done in Rust
-    type Item<'a>
+    /// Cloned should be Self, but currently this can't be done in Rust
+    type Cloned<'a>
     where
         Self: 'a;
-    fn partial_clone<'b>(&'b self) -> Self::Item<'b>;
+    fn partial_clone<'b>(&'b self) -> Self::Cloned<'b>;
 }
 
 impl<T> PartialClone for T
 where
     T: Clone,
 {
-    type Item<'a>
+    type Cloned<'a>
         = T
     where
         Self: 'a;
 
-    fn partial_clone<'b>(&'b self) -> Self::Item<'b> {
+    fn partial_clone<'b>(&'b self) -> Self::Cloned<'b> {
         self.clone()
     }
 }

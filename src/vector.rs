@@ -243,6 +243,14 @@ where
     _lifetime: PhantomData<&'a T>,
 }
 
+unsafe impl<const B: usize, T: Sync, A: Allocator + Clone> Send for PersVector<'_, B, T, A> where
+    [(); bytes(B)]:
+{
+}
+unsafe impl<const B: usize, T: Sync, A: Allocator + Clone> Sync for PersVector<'_, B, T, A> where
+    [(); bytes(B)]:
+{
+}
 impl<'a, const B: usize, T: 'a, A: Allocator + Clone> Drop for PersVector<'a, B, T, A>
 where
     [(); bytes(B)]:,
@@ -277,11 +285,7 @@ where
         }
     }
     pub fn iter<'b>(&'b self) -> IterPersVec<'b, B, T, A> {
-        IterPersVec {
-            front: 0,
-            back: self.len(),
-            vector: self.partial_clone(),
-        }
+        self.partial_clone().into_iter()
     }
     fn depth(length: usize) -> u32 {
         if length == 0 { 0 } else { length.ilog(B) }
@@ -351,11 +355,11 @@ impl<const B: usize, T, A: Allocator + Clone> PartialClone for PersVector<'_, B,
 where
     [(); bytes(B)]:,
 {
-    type Item<'a>
+    type Cloned<'a>
         = PersVector<'a, B, T, A>
     where
         Self: 'a;
-    fn partial_clone<'b>(&'b self) -> Self::Item<'b> {
+    fn partial_clone<'b>(&'b self) -> Self::Cloned<'b> {
         Self {
             head: Node::<B, T, A>::partial_borrow(&self.head),
             allocator: self.allocator.clone(),
@@ -373,6 +377,34 @@ where
         self.get(index).unwrap()
     }
 }
+// TODO FromIterator for ref and box
+// can this be impl for non global?
+impl<'a, const B: usize, T> FromIterator<T> for PersVector<'a, B, T, Global>
+where
+    [(); bytes(B)]:,
+{
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        let mut pv = Self::new();
+        for t in iter.into_iter() {
+            pv = pv.append(t);
+        }
+        pv
+    }
+}
+impl<'a, const B: usize, T, A: Allocator + Clone> IntoIterator for PersVector<'a, B, T, A>
+where
+    [(); bytes(B)]:,
+{
+    type Item = &'a T;
+    type IntoIter = IterPersVec<'a, B, T, A>;
+    fn into_iter(self) -> Self::IntoIter {
+        Self::IntoIter {
+            front: 0,
+            back: self.len(),
+            vector: self,
+        }
+    }
+}
 pub struct IterPersVec<'a, const B: usize, T, A: Allocator + Clone>
 where
     [(); bytes(B)]:,
@@ -386,6 +418,7 @@ impl<'a, const B: usize, T, A: Allocator + Clone> Iterator for IterPersVec<'a, B
 where
     [(); bytes(B)]:,
 {
+    // TODO could pop items
     type Item = &'a T;
     // these unsafes are fine since vector cant be mutated or taken once it enters the iterator
     fn next(&mut self) -> Option<Self::Item> {
