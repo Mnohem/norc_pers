@@ -9,11 +9,14 @@
 // #![no_std]
 #![cfg_attr(not(feature = "allocator-api2"), feature(allocator_api))]
 
+pub mod borrow;
 mod list;
 mod vector;
 
 pub use list::List;
 pub use vector::PersVector;
+
+use core::{ops::Deref, ptr::NonNull};
 
 cfg_if::cfg_if! {
     if #[cfg(feature = "allocator-api2")] {
@@ -21,20 +24,29 @@ cfg_if::cfg_if! {
         pub(crate) use allocator_api2::boxed;
         use allocator_api2::alloc::Allocator;
         use allocator_api2::boxed::Box;
+        pub(crate) unsafe fn into_non_null<T: ?Sized, A: Allocator>(boxed: Box<T, A>) -> NonNull<T> {
+            Box::into_non_null(boxed).0
+        }
     } else if #[cfg(feature = "std")] {
         pub(crate) use std::alloc;
         pub(crate) use std::boxed;
         use std::alloc::Allocator;
         use std::boxed::Box;
+        pub(crate) unsafe fn into_non_null<T: ?Sized, A: Allocator>(boxed: Box<T, A>) -> NonNull<T> {
+            Box::into_non_null_with_allocator(boxed).0
+        }
     } else {
         extern crate alloc as mem;
         pub(crate) use mem::alloc;
         pub(crate) use mem::boxed;
         use mem::alloc::Allocator;
         use mem::boxed::Box;
+        pub(crate) unsafe fn into_non_null<T: ?Sized, A: Allocator>(boxed: Box<T, A>) -> NonNull<T> {
+            Box::into_non_null_with_allocator(boxed).0
+        }
     }
 }
-use core::{ops::Deref, ptr::NonNull};
+
 #[derive(Debug, Clone)]
 enum Ref<'a, T: ?Sized> {
     Boxed(Box<T>),
@@ -73,27 +85,6 @@ where
 {
     fn as_ref(&self) -> &T {
         self.deref()
-    }
-}
-union UnsafeRef<'a, T: ?Sized> {
-    boxed: NonNull<T>,
-    borrowed: &'a T,
-}
-impl<'a, T: ?Sized> UnsafeRef<'a, T> {
-    cfg_if::cfg_if! {
-    if #[cfg(feature = "allocator-api2")] {
-        pub fn from_box<A: Allocator>(val: Box<T, A>) -> Self {
-            UnsafeRef {
-                boxed: Box::<T, A>::into_non_null(val).0
-            }
-        }
-    } else {
-        pub fn from_box<A: Allocator>(val: Box<T, A>) -> Self {
-            UnsafeRef {
-                boxed: Box::<T, A>::into_non_null_with_allocator(val).0
-            }
-        }
-    }
     }
 }
 pub const fn bytes(n: usize) -> usize {
