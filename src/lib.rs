@@ -5,16 +5,19 @@
 #![feature(maybe_uninit_slice)]
 #![feature(generic_const_exprs)]
 #![feature(box_into_inner)]
+#![feature(ptr_as_uninit)]
+#![feature(breakpoint)]
 #![cfg_attr(not(any(test, feature = "std")), no_std)]
 // #![no_std]
 #![cfg_attr(not(feature = "allocator-api2"), feature(allocator_api))]
 
 pub mod borrow;
 mod list;
+pub(crate) mod node;
 mod vector;
 
 pub use list::List;
-pub use vector::PersVector;
+pub use vector::PersVec;
 
 use core::{ops::Deref, ptr::NonNull};
 
