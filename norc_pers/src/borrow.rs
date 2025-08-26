@@ -16,9 +16,11 @@ pub trait PartialClone {
 }
 /// This trait exists to facilitate more efficient memory usage with partial clones. When you have
 /// partially cloned a value, and then wish to replace the original with that possibly modified
-/// clone, without this trait, there will be lifetime constraints and manual memory management.
-/// A call to succeed is meant to effectively invert the dependence of `clone` on `self`, to a
-/// dependence of `self` on `clone`, thus `self` can be dropped while `clone` is still live.
+/// clone, there will be lifetime constraints that prevent that pattern, since the clone is still
+/// borrowing from the original. A call to succeed is meant to effectively invert the dependence of
+/// `clone` on `self`, to a dependence of `self` on `clone`, thus `self` can be safely dropped
+/// while `clone` is still live. `PartialClone::extend_inner_lifetime` can then be used to extend
+/// the lifetime of the clone.
 pub trait Succeed: PartialClone {
     /// Gives ownership of shared values from `self` to `clone`
     /// # Safety
@@ -26,14 +28,14 @@ pub trait Succeed: PartialClone {
     /// use of concurrent, shared reference are allowed, such as `PersVec::get` and
     /// `PartialClone::partial_clone`. After this call, dropping `clone` before `self` is undefined
     /// behavior. It is up to the caller to manage lifetimes so that this does not happen, and
-    /// consider other clones and reference to `self` that may still be live. Calling `succeed`
-    /// when `clone` does not originate as a clone of `self` preserves all stated behavior.
+    /// consider other references to `self` that may still be live. Calling `succeed` when `clone`
+    /// does not originate as a clone of `self` preserves all stated behavior.
     unsafe fn succeed<'c>(&'c self, clone: &Self::Cloned<'c>);
 }
 
 impl<T> PartialClone for T
 where
-    T: Copy,
+    T: Clone,
 {
     type Cloned<'a>
         = T
@@ -41,7 +43,7 @@ where
         Self: 'a;
 
     fn partial_clone<'c>(&'c self) -> Self::Cloned<'c> {
-        *self
+        self.clone()
     }
     unsafe fn extend_inner_lifetime<'c>(clone: Self::Cloned<'c>) -> Self
     where
@@ -52,7 +54,7 @@ where
 }
 impl<T> Succeed for T
 where
-    T: Copy + PartialClone,
+    T: Clone + PartialClone,
 {
     unsafe fn succeed<'c>(&'c self, _: &Self::Cloned<'c>) {}
 }
