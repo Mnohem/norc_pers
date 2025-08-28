@@ -9,6 +9,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
+name = "allocator-api2"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "78200ac3468a57d333cd0ea5dd398e25111194dcacd49208afca95c629a6311d"
+
+[[package]]
 name = "cfg-if"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -18,6 +24,15 @@ checksum = "2fd1289c04a9ea8cb22300a459a72a385d7c73d3259e2ed7dcb2af674838cfa9"
 name = "norc_pers"
 version = "0.1.0"
 dependencies = [
- "allocator-api2",
+ "allocator-api2 0.2.21",
  "cfg-if",
+]
+
+[[package]]
+name = "norc_sync"
+version = "0.1.0"
+dependencies = [
+ "allocator-api2 0.3.0",
+ "cfg-if",
+ "norc_pers",
 ]

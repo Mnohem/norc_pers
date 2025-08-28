@@ -35,7 +35,7 @@ pub trait Succeed: PartialClone {
 
 impl<T> PartialClone for T
 where
-    T: Clone,
+    T: Copy,
 {
     type Cloned<'a>
         = T
@@ -43,7 +43,7 @@ where
         Self: 'a;
 
     fn partial_clone<'c>(&'c self) -> Self::Cloned<'c> {
-        self.clone()
+        *self
     }
     unsafe fn extend_inner_lifetime<'c>(clone: Self::Cloned<'c>) -> Self
     where

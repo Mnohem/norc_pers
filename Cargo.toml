@@ -1,5 +1,5 @@
 [workspace]
 members = [
-    "norc_pers",
+    "norc_pers", "norc_sync",
 ]
 resolver = "3"
