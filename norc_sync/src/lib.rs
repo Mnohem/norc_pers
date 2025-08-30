@@ -5,7 +5,6 @@
 #![cfg_attr(not(feature = "allocator-api2"), feature(allocator_api))]
 use core::{
     marker::PhantomData,
-    mem::forget,
     ops::Deref,
     ptr::NonNull,
     sync::atomic::{AtomicPtr, Ordering},
@@ -32,17 +31,17 @@ struct Node<T, A: Allocator + Send + Sync + Clone = Global> {
 }
 
 pub struct Transactor<
-    'a,
-    T: 'a + PartialClone + Succeed,
+    't,
+    T: 't + PartialClone + Succeed,
     A: Allocator + Send + Sync + Clone = Global,
 > {
     history: AtomicPtr<Node<T, A>>,
-    _inner_lifetime: PhantomData<&'a T>,
+    _inner_lifetime: PhantomData<&'t T>,
     allocator: A,
 }
 
-impl<'a, T: 'a + PartialClone + Succeed, A: Allocator + Send + Sync + Clone> Drop
-    for Transactor<'a, T, A>
+impl<'t, T: 't + PartialClone + Succeed, A: Allocator + Send + Sync + Clone> Drop
+    for Transactor<'t, T, A>
 {
     fn drop(&mut self) {
         let mut node = unsafe { Box::from_raw_in(*self.history.as_ptr(), self.allocator.clone()) };
@@ -51,13 +50,13 @@ impl<'a, T: 'a + PartialClone + Succeed, A: Allocator + Send + Sync + Clone> Dro
         }
     }
 }
-impl<'a, T: 'a + PartialClone + Succeed> Transactor<'a, T, Global> {
+impl<'t, T: 't + PartialClone + Succeed> Transactor<'t, T, Global> {
     pub fn new(item: T) -> Self {
         Self::new_in(item, Global)
     }
 }
-impl<'a, T: 'a + PartialClone + Succeed, A: 'a + Allocator + Clone + Send + Sync>
-    Transactor<'a, T, A>
+impl<'t, T: 't + PartialClone + Succeed, A: 't + Allocator + Clone + Send + Sync>
+    Transactor<'t, T, A>
 {
     pub fn new_in(item: T, allocator: A) -> Self {
         Self {
@@ -76,6 +75,7 @@ impl<'a, T: 'a + PartialClone + Succeed, A: 'a + Allocator + Clone + Send + Sync
         }
     }
 
+    // TODO T -> T::Cloned so that self cant be dropped while snapshot is live
     pub fn snapshot(&self) -> Arc<T, A> {
         unsafe {
             self.history
@@ -88,9 +88,14 @@ impl<'a, T: 'a + PartialClone + Succeed, A: 'a + Allocator + Clone + Send + Sync
     }
 
     // Returns back the pointer value on failure
-    fn inner_commit_loop<F>(&self, history_head: *mut Node<T, A>, f: F) -> Option<*mut Node<T, A>>
+    fn inner_commit_loop<F>(
+        &self,
+        history_head: *mut Node<T, A>,
+        f: F,
+        needs_consistency: bool,
+    ) -> Option<*mut Node<T, A>>
     where
-        F: Fn(&'a T) -> Option<T::Cloned<'a>>,
+        F: Fn(&'t T) -> Option<T::Cloned<'t>>,
     {
         let new_value = unsafe {
             PartialClone::extend_inner_lifetime(f(history_head
@@ -107,7 +112,10 @@ impl<'a, T: 'a + PartialClone + Succeed, A: 'a + Allocator + Clone + Send + Sync
             self.allocator.clone(),
         ))
         .0;
-        if let Err(swapped_in_history_head) = self.history.compare_exchange_weak(
+        if !needs_consistency {
+            self.history.store(new_history_head, Ordering::Release);
+            None
+        } else if let Err(swapped_in_history_head) = self.history.compare_exchange_weak(
             history_head,
             new_history_head,
             Ordering::Release,
@@ -122,9 +130,9 @@ impl<'a, T: 'a + PartialClone + Succeed, A: 'a + Allocator + Clone + Send + Sync
     /// Attempts to run the given closure on the in-transaction-value and update the transactor
     /// with the result. If the in-transaction-value has changed during this, we do not update.
     /// If successful, returns `true`, else `false`.
-    pub fn raw_commit<'t, F>(&'t self, f: F) -> bool
+    pub fn raw_commit<F>(&self, f: F) -> bool
     where
-        F: FnOnce(&'a T) -> T::Cloned<'a>,
+        F: FnOnce(&'t T) -> T::Cloned<'t>,
     {
         let history_head = self.history.load(Ordering::Acquire);
         let new_value = unsafe {
@@ -158,6 +166,37 @@ impl<'a, T: 'a + PartialClone + Succeed, A: 'a + Allocator + Clone + Send + Sync
             true
         }
     }
+
+    pub fn transact<F: Fn(&'t T) -> Option<T::Cloned<'t>>>(
+        &'t self,
+        f: F,
+    ) -> Transaction<'t, T, A, F> {
+        Transaction {
+            transactor: self,
+            action: f,
+            needs_consistency: true,
+        }
+    }
+    pub fn alter<F: Fn(&'t T) -> T::Cloned<'t> + 't>(
+        &'t self,
+        f: F,
+    ) -> Transaction<'t, T, A, impl Fn(&'t T) -> Option<T::Cloned<'t>>> {
+        Transaction {
+            transactor: self,
+            action: move |x| Some(f(x)),
+            needs_consistency: true,
+        }
+    }
+    pub fn set_with<F: Fn() -> T::Cloned<'t> + 't>(
+        &'t self,
+        f: F,
+    ) -> Transaction<'t, T, A, impl Fn(&'t T) -> Option<T::Cloned<'t>>> {
+        Transaction {
+            transactor: self,
+            action: move |_| Some(f()),
+            needs_consistency: false,
+        }
+    }
     // TODO Should be able to react to change in ref. this should be called after an asynchronous
     // commit finishes. The user will probably consume this as a stream
     pub fn wake_waiter() {
@@ -165,61 +204,36 @@ impl<'a, T: 'a + PartialClone + Succeed, A: 'a + Allocator + Clone + Send + Sync
     }
 }
 
-pub trait Transact<'t>
-where
-    Self: 't,
-{
-    type Alloc: Allocator + Clone + Send + Sync;
-    type Item: PartialClone + Succeed;
+pub struct Transaction<
+    't,
+    T: PartialClone + Succeed,
+    A: Allocator + Send + Sync + Clone + 't,
+    F: Fn(&'t T) -> Option<T::Cloned<'t>>,
+> {
+    transactor: &'t Transactor<'t, T, A>,
+    action: F,
+    needs_consistency: bool,
+}
 
-    fn transactor(&self) -> &Transactor<'t, Self::Item, Self::Alloc>;
-    fn action(
-        &self,
-    ) -> impl Fn(&'t Self::Item) -> Option<<<Self as Transact>::Item as PartialClone>::Cloned<'t>>;
-    /// Runs the given closure on the in-transaction-value and update the transactor with the
-    /// result. If the in-transaction-value has changed during this, we rerun the closure and try
-    /// again, blocking until we succeed.
-    fn commit(&self) {
-        let transactor = self.transactor();
+impl<
+    't,
+    T: PartialClone + Succeed,
+    A: Allocator + Send + Sync + Clone,
+    F: Fn(&'t T) -> Option<T::Cloned<'t>>,
+> Transaction<'t, T, A, F>
+{
+    pub fn commit(&self) {
+        let Transaction {
+            transactor,
+            action,
+            needs_consistency,
+        } = self;
         let mut history_ptr = transactor.history.load(Ordering::Acquire);
-        while let Some(swapped_in_ptr) = transactor.inner_commit_loop(history_ptr, self.action()) {
+        while let Some(swapped_in_ptr) =
+            transactor.inner_commit_loop(history_ptr, action, *needs_consistency)
+        {
             history_ptr = swapped_in_ptr;
         }
-    }
-}
-
-#[must_use]
-pub fn alter<'t, T, F, A>(transactor: &'t Transactor<'t, T, A>, act: F) -> Alteration<'t, T, F, A>
-where
-    T: PartialClone + Succeed,
-    F: Fn(&'t T) -> T::Cloned<'t>,
-    A: Allocator + Clone + Send + Sync,
-{
-    Alteration { transactor, act }
-}
-
-pub struct Alteration<'t, T, F, A = Global>
-where
-    T: PartialClone + Succeed,
-    F: Fn(&'t T) -> T::Cloned<'t>,
-    A: Allocator + Clone + Send + Sync,
-{
-    transactor: &'t Transactor<'t, T, A>,
-    act: F,
-}
-impl<'t, T, F: 't, A> Transact<'t> for Alteration<'t, T, F, A>
-where
-    T: PartialClone + Succeed,
-    F: Fn(&'t T) -> T::Cloned<'t>,
-    A: Allocator + Clone + Send + Sync,
-{
-    type Alloc = A;
-    type Item = T;
-    fn transactor(&self) -> &Transactor<'t, T, A> {
-        self.transactor
-    }
-    fn action(&self) -> impl Fn(&'t T) -> Option<<T as PartialClone>::Cloned<'t>> {
-        |t| Some((self.act)(t))
     }
 }
 
@@ -234,12 +248,12 @@ mod tests {
         scope(|s| {
             s.spawn(|| {
                 for i in 0..1000usize {
-                    alter(&transactor, |pv| pv.partial_clone().append(i)).commit();
+                    transactor.alter(|pv| pv.partial_clone().append(i)).commit();
                 }
             });
             s.spawn(|| {
                 for i in 1000..2000usize {
-                    alter(&transactor, |pv| pv.partial_clone().append(i)).commit();
+                    transactor.alter(|pv| pv.partial_clone().append(i)).commit();
                 }
             });
         });
@@ -251,10 +265,16 @@ mod tests {
             let snapshot = transactor.snapshot();
             scope(|s| {
                 s.spawn(|| {
-                    alter(&transactor, |_| snapshot.partial_clone().append(3)).commit();
-                    alter(&transactor, |_| snapshot.partial_clone().append(2)).commit();
+                    transactor
+                        .set_with(|| snapshot.partial_clone().append(3))
+                        .commit();
+                    transactor
+                        .set_with(|| snapshot.partial_clone().append(2))
+                        .commit();
                 });
             });
+            assert_eq!(snapshot.len(), 1);
+            assert_eq!(snapshot.first().unwrap(), &1);
         }
         assert_eq!(*transactor.snapshot().first().unwrap(), 1);
         assert_eq!(*transactor.snapshot().last().unwrap(), 2);
