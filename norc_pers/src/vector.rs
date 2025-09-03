@@ -109,7 +109,11 @@ where
         }
     }
     pub fn iter<'c>(&'c self) -> IterPersVec<'c, T, B, A> {
-        self.partial_clone().into_iter()
+        IterPersVec {
+            front: 0,
+            back: self.len(),
+            vector: self,
+        }
     }
     pub fn len(&self) -> usize {
         self.total_length
@@ -612,20 +616,6 @@ where
         self.get(index).unwrap()
     }
 }
-impl<'a, const B: usize, T, A: Allocator + Clone> IntoIterator for PersVec<'a, T, B, A>
-where
-    [(); bytes(B)]:,
-{
-    type Item = &'a T;
-    type IntoIter = IterPersVec<'a, T, B, A>;
-    fn into_iter(self) -> Self::IntoIter {
-        Self::IntoIter {
-            front: 0,
-            back: self.len(),
-            vector: self,
-        }
-    }
-}
 
 impl<const B: usize, T, A: Allocator + Clone + Default> FromIterator<T>
     for PersVec<'static, T, B, A>
@@ -647,7 +637,7 @@ where
 {
     front: usize,
     back: usize,
-    vector: PersVec<'a, T, B, A>,
+    vector: &'a PersVec<'a, T, B, A>,
 }
 
 impl<'a, const B: usize, T, A: Allocator + Clone> Iterator for IterPersVec<'a, T, B, A>
@@ -664,14 +654,14 @@ where
         if self.front > self.back {
             return None;
         };
-        unsafe { core::mem::transmute(self.vector.get(self.front - 1)) }
+        self.vector.get(self.front - 1)
     }
     fn nth(&mut self, n: usize) -> Option<Self::Item> {
         self.front += n + 1;
         if self.front > self.back {
             return None;
         };
-        unsafe { core::mem::transmute(self.vector.get(self.front - 1)) }
+        self.vector.get(self.front - 1)
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
         let size = self.back - self.front;
@@ -689,7 +679,7 @@ where
         if self.front > self.back {
             return None;
         };
-        unsafe { core::mem::transmute(self.vector.get(self.back)) }
+        self.vector.get(self.back)
     }
     fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
         self.back = self.back.checked_sub(n)?;
