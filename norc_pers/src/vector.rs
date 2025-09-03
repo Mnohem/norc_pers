@@ -449,24 +449,34 @@ where
                 //      for where it should be at the end of the shorter tree, if we reach it
                 unsafe {
                     if self.total_length > clone.total_length {
+                        // special case: the only length is in the tail, so we succeed that
                         let clone_tail_length = Self::tail_length(clone.total_length);
-                        orig_head.succeed_nodes_missing_clone_tail(
-                            clone_head,
-                            min_length_without_tail,
-                            min_depth,
-                            clone_tail,
-                            clone_tail_length,
-                        );
+                        if min_length_without_tail == 0 {
+                            orig_head.succeed_nodes(clone_tail, clone_tail_length, 0);
+                        } else {
+                            orig_head.succeed_nodes_missing_clone_tail(
+                                clone_head,
+                                min_length_without_tail,
+                                min_depth,
+                                clone_tail,
+                                clone_tail_length,
+                            );
+                        }
                     } else {
                         // self.total_length < clone.total_length
+                        // special case: the only length is in the tail, so we succeed that
                         let orig_tail_length = Self::tail_length(self.total_length);
-                        orig_head.succeed_nodes_missing_self_tail(
-                            clone_head,
-                            min_length_without_tail,
-                            min_depth,
-                            orig_tail,
-                            orig_tail_length,
-                        );
+                        if min_length_without_tail == 0 {
+                            orig_tail.succeed_nodes(clone_head, orig_tail_length, 0);
+                        } else {
+                            orig_head.succeed_nodes_missing_self_tail(
+                                clone_head,
+                                min_length_without_tail,
+                                min_depth,
+                                orig_tail,
+                                orig_tail_length,
+                            );
+                        }
                     }
                 }
             } else if min_length_without_tail / B == B.pow(min_depth) {
@@ -693,7 +703,7 @@ impl<const B: usize, T, A: Allocator + Clone> ExactSizeIterator for IterPersVec<
 
 #[cfg(test)]
 mod tests {
-    use crate::*;
+    use crate::{borrow::Succeed, *};
     use borrow::PartialClone;
 
     #[test]
@@ -852,6 +862,19 @@ mod tests {
                 assert_eq!(new.get(i - 1).unwrap().get(j), Some(&j));
             }
             assert_eq!(new.get(i - 1).unwrap().get(i), None);
+        }
+    }
+    #[test]
+    fn many_succeed() {
+        let mut new: PersVec<usize, 4> = pers_vec![];
+        for i in 0..100 {
+            let clone = new.partial_clone().append(i);
+            unsafe { new.succeed(&clone) };
+            new = unsafe { PartialClone::extend_inner_lifetime(clone) };
+            println!("{i}");
+            for j in 0..=i {
+                assert_eq!(new.get(j), Some(&j));
+            }
         }
     }
 }
