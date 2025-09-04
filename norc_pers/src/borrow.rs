@@ -29,7 +29,9 @@ pub trait Succeed: PartialClone {
     /// `PartialClone::partial_clone`. After this call, dropping `clone` before `self` is undefined
     /// behavior. It is up to the caller to manage lifetimes so that this does not happen, and
     /// consider other references to `self` that may still be live. Calling `succeed` when `clone`
-    /// does not originate as a clone of `self` preserves all stated behavior.
+    /// does not originate as a clone of `self` preserves all stated behavior. It is undefined
+    /// behavior to call this method when `self` and `clone` come from the same "lineage" of clones
+    /// but are not immediate parent(`self`) and child(`clone`).
     unsafe fn succeed<'c>(&'c self, clone: &Self::Cloned<'c>);
 }
 

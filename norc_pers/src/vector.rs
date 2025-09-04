@@ -867,4 +867,31 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn succeed_ancestors_proper() {
+        let mut family: Vec<PersVec<usize, 4>> = vec![pers_vec![]];
+        for i in 0..100 {
+            let new_child =
+                unsafe { PartialClone::extend_inner_lifetime(family[i].partial_clone().append(i)) };
+            family.push(new_child);
+        }
+        for i in 0..100 {
+            unsafe { family[i].succeed(&family[i + 1]) };
+        }
+        let last = family.pop().unwrap();
+        drop(family);
+        for (i, &el) in last.iter().enumerate() {
+            assert_eq!(el, i);
+        }
+
+        let mut family: Vec<PersVec<usize, 4>> = vec![last];
+        for i in 0..100 {
+            let new_child =
+                unsafe { PartialClone::extend_inner_lifetime(family[i].partial_clone().pop()) };
+            family.push(new_child);
+        }
+        for i in 0..100 {
+            unsafe { family[i].succeed(&family[i + 1]) };
+        }
+    }
 }
