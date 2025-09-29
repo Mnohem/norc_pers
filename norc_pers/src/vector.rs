@@ -151,7 +151,7 @@ where
         Some(unsafe { node.branches.values.get(branch_idx).unwrap().as_ref() })
     }
     pub fn last(&self) -> Option<&T> {
-        self.get(self.total_length - 1)
+        self.get(self.total_length.checked_sub(1)?)
     }
     pub fn first(&self) -> Option<&T> {
         self.get(0)

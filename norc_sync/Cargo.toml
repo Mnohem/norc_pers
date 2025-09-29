@@ -9,4 +9,5 @@ cfg-if = "1.0.3"
 norc_pers = { path = "../norc_pers" }
 
 [features]
-default = []
+default = ["std"]
+std = []

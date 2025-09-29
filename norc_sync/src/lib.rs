@@ -1,13 +1,15 @@
 #![expect(incomplete_features)]
 #![feature(generic_const_exprs)]
 #![feature(box_into_inner)]
-#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(any(test, feature = "std")), no_std)]
 #![cfg_attr(not(feature = "allocator-api2"), feature(allocator_api))]
 use core::{
+    cell::UnsafeCell,
     marker::PhantomData,
     ops::Deref,
     ptr::NonNull,
-    sync::atomic::{AtomicBool, AtomicPtr, Ordering},
+    sync::atomic::{AtomicPtr, Ordering},
+    task::Waker,
 };
 use norc_pers::borrow::{PartialClone, Succeed};
 cfg_if::cfg_if! {
@@ -26,207 +28,188 @@ cfg_if::cfg_if! {
 }
 
 struct Node<T> {
+    newer: UnsafeCell<Option<NonNull<Node<T>>>>,
     data: T,
-    next: Option<NonNull<Node<T>>>,
 }
 
-pub struct Transactor<
-    't,
+pub struct Transactor<'t, T, A = Global>
+where
     T: 't + PartialClone + Succeed,
-    A: Allocator + Send + Sync + Clone = Global,
-> {
-    history: AtomicPtr<Node<Arc<T, A>>>,
-    ongoing_succession: AtomicBool,
+    A: Allocator + Send + Sync + Clone,
+{
+    oldest: NonNull<Node<Arc<T, A>>>,
+    newest: AtomicPtr<Node<Arc<T, A>>>, // tagged with 3 bit version to counteract ABA
+    waiters: (),
     _inner_lifetime: PhantomData<&'t T>,
     allocator: A,
 }
 
-impl<'t, T: 't + PartialClone + Succeed, A: Allocator + Send + Sync + Clone> Drop
-    for Transactor<'t, T, A>
+unsafe impl<'t, T, A> Send for Transactor<'t, T, A>
+where
+    T: 't + PartialClone + Succeed + Sync,
+    A: Allocator + Send + Sync + Clone,
+{
+}
+
+unsafe impl<'t, T, A> Sync for Transactor<'t, T, A>
+where
+    T: 't + PartialClone + Succeed + Sync,
+    A: Allocator + Send + Sync + Clone,
+{
+}
+
+impl<'t, T, A> Drop for Transactor<'t, T, A>
+where
+    T: 't + PartialClone + Succeed,
+    A: Allocator + Send + Sync + Clone,
 {
     fn drop(&mut self) {
-        let mut node = unsafe { Box::from_raw_in(*self.history.as_ptr(), self.allocator.clone()) };
-        while let Some(next_ptr) = node.next {
-            node = unsafe { Box::from_raw_in(next_ptr.as_ptr(), self.allocator.clone()) };
+        let Node {
+            newer: mut node,
+            mut data,
+        } = Box::into_inner(unsafe {
+            Box::from_raw_in(self.oldest.as_ptr(), self.allocator.clone())
+        });
+        while node.get_mut().is_some() {
+            Node { newer: node, data } = Box::into_inner(unsafe {
+                Box::from_raw_in(
+                    node.get_mut().unwrap_unchecked().as_ptr(),
+                    self.allocator.clone(),
+                )
+            });
         }
+        drop(data)
     }
 }
-impl<'t, T: 't + PartialClone + Succeed> Transactor<'t, T, Global> {
+impl<'t, T> Transactor<'t, T, Global>
+where
+    T: 't + PartialClone + Succeed,
+{
     pub fn new(item: T) -> Self {
         Self::new_in(item, Global)
     }
 }
-impl<'t, T: 't + PartialClone + Succeed, A: 't + Allocator + Clone + Send + Sync>
-    Transactor<'t, T, A>
+impl<'t, T, A> Transactor<'t, T, A>
+where
+    T: 't + PartialClone + Succeed,
+    A: 't + Allocator + Clone + Send + Sync,
 {
     pub fn new_in(item: T, allocator: A) -> Self {
+        let first = Box::into_raw_with_allocator(Box::new_in(
+            Node {
+                data: Arc::new_in(item, allocator.clone()),
+                newer: UnsafeCell::new(None),
+            },
+            allocator.clone(),
+        ))
+        .0;
         Self {
-            history: AtomicPtr::new(
-                Box::into_raw_with_allocator(Box::new_in(
-                    Node {
-                        data: Arc::new_in(item, allocator.clone()),
-                        next: None,
-                    },
-                    allocator.clone(),
-                ))
-                .0,
-            ),
-            ongoing_succession: AtomicBool::new(false),
+            oldest: unsafe { NonNull::new(first).unwrap_unchecked() },
+            newest: AtomicPtr::new(first),
+            waiters: (),
             _inner_lifetime: PhantomData,
             allocator,
         }
     }
     /// Returns the snapshot that was just released from the history,
-    /// or `None` if there is nothing to free or the lock was already taken
-    pub fn release_last_snapshot(&self) -> Option<Arc<T::Cloned<'t>, A>> {
-        if !self.ongoing_succession.swap(true, Ordering::Acquire) {
-            let latest = self.history.load(Ordering::Acquire);
-            let previous_ref = unsafe { latest.as_ref().unwrap_unchecked().next? };
-            let previous =
-                unsafe { Box::from_raw_in(previous_ref.as_ptr(), self.allocator.clone()) };
-            unsafe {
-                previous.data.succeed(
-                    &latest
-                        .cast::<Node<Arc<T::Cloned<'_>, A>>>()
-                        .as_ref()
-                        .unwrap_unchecked()
-                        .data,
-                )
-            };
-            unsafe { (*latest).next = previous.next };
-            self.ongoing_succession.store(false, Ordering::Release);
-            Some(unsafe {
-                previous_ref
-                    .as_ptr()
+    /// or `None` if there is nothing to free
+    fn inner_release_oldest(&mut self) -> Option<Arc<T::Cloned<'t>, A>> {
+        let mut oldest = self.oldest;
+        let second_oldest = (*unsafe { oldest.as_mut() }.newer.get_mut())?;
+        unsafe {
+            self.oldest.as_ref().data.succeed(
+                &second_oldest
                     .cast::<Node<Arc<T::Cloned<'_>, A>>>()
-                    .read()
-                    .data
-            })
-        } else {
-            None
-        }
+                    .as_ref()
+                    .data,
+            );
+            self.oldest = second_oldest;
+        };
+        let oldest_alloc: Box<Node<Arc<T::Cloned<'_>, A>>, A> =
+            unsafe { Box::from_raw_in(oldest.as_ptr().cast(), self.allocator.clone()) };
+        Some(oldest_alloc.data)
     }
-    /// Returns true if all history has been cleared from the transactor, false if the
+
+    pub fn release_oldest_snapshot(&mut self) -> Option<Arc<T::Cloned<'t>, A>> {
+        self.inner_release_oldest()
+    }
+    /// Returns true if some history has been cleared from the transactor, false if the
     /// history is already being cleared elsewhere
-    pub fn clear_history(&self) -> bool {
-        if !self.ongoing_succession.swap(true, Ordering::Acquire) {
-            let latest = self.history.load(Ordering::Acquire);
-            loop {
-                let Some(previous_ref) = unsafe { latest.as_ref().unwrap_unchecked() }.next else {
-                    self.ongoing_succession.store(false, Ordering::Release);
-                    break true;
-                };
-                let previous = Box::into_inner(unsafe {
-                    Box::from_raw_in(previous_ref.as_ptr(), self.allocator.clone())
-                });
-                unsafe {
-                    previous.data.succeed(
-                        &latest
-                            .cast::<Node<Arc<T::Cloned<'_>, A>>>()
-                            .as_ref()
-                            .unwrap_unchecked()
-                            .data,
-                    )
-                };
-                drop(previous.data);
-                unsafe { (*latest).next = previous.next };
-            }
-        } else {
-            false
-        }
+    pub fn clear_history(&mut self) {
+        while self.inner_release_oldest().is_some() {}
     }
 
     pub fn snapshot(&self) -> Arc<T::Cloned<'t>, A> {
-        Arc::clone(
-            &unsafe {
-                self.history
-                    .load(Ordering::Acquire)
-                    .cast::<Node<Arc<T::Cloned<'_>, A>>>()
-                    .as_ref()
-                    .unwrap_unchecked()
-            }
-            .data,
-        )
+        Arc::clone(unsafe {
+            self.newest
+                .load(Ordering::Acquire)
+                .cast::<Arc<T::Cloned<'_>, A>>()
+                .as_ref()
+                .unwrap_unchecked()
+        })
     }
 
-    // Returns back the pointer value on failure
-    fn inner_commit_loop<F>(
+    /// Returns true if we were able to try to alter the value, false if we saw the address change
+    fn inner_optional_commit_loop<F>(
         &self,
-        history_head: *mut Node<Arc<T, A>>,
+        newest: *mut Node<Arc<T, A>>,
         f: F,
-        needs_consistency: bool,
     ) -> Option<*mut Node<Arc<T, A>>>
     where
         F: Fn(&'t T) -> Option<T::Cloned<'t>>,
     {
         let new_value = unsafe {
-            PartialClone::extend_inner_lifetime(f(history_head
-                .as_ref()
-                .unwrap_unchecked()
-                .data
-                .deref())?)
-        };
-        let new_history_head: *mut Node<Arc<T, A>> = Box::into_raw_with_allocator(Box::new_in(
+            f(newest.as_ref().unwrap_unchecked().data.deref())
+                .map(|x| PartialClone::extend_inner_lifetime(x))
+        }?;
+
+        let to_be_newest_node: *mut Node<Arc<T, A>> = Box::into_raw_with_allocator(Box::new_in(
             Node {
                 data: Arc::new_in(new_value, self.allocator.clone()),
-                next: NonNull::new(history_head),
+                newer: UnsafeCell::new(None),
             },
             self.allocator.clone(),
         ))
         .0;
-        if !needs_consistency {
-            self.history.store(new_history_head, Ordering::Release);
-            None
-        } else if let Err(swapped_in_history_head) = self.history.compare_exchange_weak(
-            history_head,
-            new_history_head,
-            Ordering::Release,
+        if let Err(other_ptr) = self.newest.compare_exchange_weak(
+            newest,
+            to_be_newest_node,
+            Ordering::AcqRel,
             Ordering::Acquire,
         ) {
-            drop(unsafe { Box::from_raw_in(new_history_head, self.allocator.clone()) });
-            Some(swapped_in_history_head)
+            unsafe { Box::from_raw_in(to_be_newest_node, self.allocator.clone()) };
+            Some(other_ptr)
         } else {
+            unsafe {
+                (*newest).newer.get().write(NonNull::new(to_be_newest_node));
+            };
+            self.wake_waiters();
             None
         }
     }
-    /// Attempts to run the given closure on the in-transaction-value and update the transactor
-    /// with the result. If the in-transaction-value has changed during this, we do not update.
-    /// If successful, returns `true`, else `false`.
-    pub fn raw_commit<F>(&self, f: F) -> bool
+    fn inner_set_commit<F>(&self, newest: *mut Node<Arc<T, A>>, f: F)
     where
-        F: FnOnce(&'t T) -> T::Cloned<'t>,
+        F: Fn(&'t T) -> Option<T::Cloned<'t>>,
     {
-        let history_head = self.history.load(Ordering::Acquire);
         let new_value = unsafe {
-            PartialClone::extend_inner_lifetime(f(history_head
-                .as_ref()
+            f(newest.as_ref().unwrap_unchecked().data.deref())
+                .map(|x| PartialClone::extend_inner_lifetime(x))
                 .unwrap_unchecked()
-                .data
-                .deref()))
         };
-        let new_history_head: *mut Node<Arc<T, A>> = Box::into_raw_with_allocator(Box::new_in(
+
+        let to_be_newest_node: *mut Node<Arc<T, A>> = Box::into_raw_with_allocator(Box::new_in(
             Node {
                 data: Arc::new_in(new_value, self.allocator.clone()),
-                next: NonNull::new(history_head),
+                newer: UnsafeCell::new(None),
             },
             self.allocator.clone(),
         ))
         .0;
-        if self
-            .history
-            .compare_exchange_weak(
-                history_head,
-                new_history_head,
-                Ordering::Release,
-                Ordering::Acquire,
-            )
-            .is_err()
-        {
-            drop(unsafe { Box::from_raw_in(new_history_head, self.allocator.clone()) });
-            false
-        } else {
-            true
-        }
+        let old = self.newest.swap(to_be_newest_node, Ordering::AcqRel);
+        unsafe {
+            (*old).newer.get().write(NonNull::new(to_be_newest_node));
+        };
+        self.wake_waiters();
     }
 
     pub fn transact<F: Fn(&'t T) -> Option<T::Cloned<'t>>>(
@@ -259,10 +242,10 @@ impl<'t, T: 't + PartialClone + Succeed, A: 't + Allocator + Clone + Send + Sync
             needs_consistency: false,
         }
     }
-    // TODO Should be able to react to change in ref. this should be called after an asynchronous
+    // TODO Should be able to react to change in ref. this should be called after an
     // commit finishes. The user will probably consume this as a stream
-    pub fn wake_waiter(&self) {
-        todo!()
+    pub fn wake_waiters(&self) {
+        // todo!()
     }
 }
 
@@ -290,11 +273,13 @@ impl<
             action,
             needs_consistency,
         } = self;
-        let mut history_ptr = transactor.history.load(Ordering::Acquire);
-        while let Some(swapped_in_ptr) =
-            transactor.inner_commit_loop(history_ptr, action, *needs_consistency)
-        {
-            history_ptr = swapped_in_ptr;
+        let mut newest = transactor.newest.load(Ordering::Acquire);
+        if *needs_consistency {
+            while let Some(other_ptr) = transactor.inner_optional_commit_loop(newest, action) {
+                newest = other_ptr;
+            }
+        } else {
+            transactor.inner_set_commit(newest, action);
         }
     }
 }
@@ -305,25 +290,83 @@ mod tests {
     use norc_pers::PersVec;
     use std::thread::scope;
     #[test]
-    fn simple_multithread() {
-        let transactor: Transactor<PersVec<usize, 4>> = Transactor::new(PersVec::new());
+    fn singlethread_clear_history() {
+        let mut transactor: Transactor<PersVec<usize, 4>> = Transactor::new(PersVec::new());
+        for i in 0..100usize {
+            transactor.alter(|pv| pv.partial_clone().append(i)).commit();
+        }
+        transactor.clear_history();
+        assert_eq!(transactor.snapshot().len(), 100);
+        let mut sum = 0;
+        for &i in transactor.snapshot().iter() {
+            assert!(i < 100);
+            sum += i;
+        }
+        assert_eq!(sum, 4950);
+    }
+    #[test]
+    fn simple_multithread_clear_history() {
+        let mut transactor: Transactor<PersVec<usize, 4>> = Transactor::new(PersVec::new());
         scope(|s| {
             s.spawn(|| {
-                for i in 0..1000usize {
+                for i in 0..100usize {
                     transactor.alter(|pv| pv.partial_clone().append(i)).commit();
                 }
             });
             s.spawn(|| {
-                for i in 1000..2000usize {
+                for i in 100..200usize {
                     transactor.alter(|pv| pv.partial_clone().append(i)).commit();
                 }
             });
         });
-        assert!(transactor.clear_history());
+        transactor.clear_history();
+        assert_eq!(transactor.snapshot().len(), 200);
+        let mut sum = 0;
+        for &i in transactor.snapshot().iter() {
+            println!("{i}");
+            assert!(i < 200);
+            sum += i;
+        }
+        assert_eq!(sum, 19900);
+    }
+    #[test]
+    fn all_concurrent() {
+        let transactor: Transactor<PersVec<usize, 4>> = Transactor::new(PersVec::new());
+        let append_1000 = || {
+            for _ in 0..1000usize {
+                transactor
+                    .alter(|pv| pv.partial_clone().append(*pv.last().unwrap_or(&0) + 1))
+                    .commit();
+            }
+        };
+        let check_sum = || {
+            let s = transactor.snapshot();
+            let expected_sum = if s.len() >= 2 {
+                s.len() * (s.len() + 1) / 2
+            } else {
+                return;
+            };
+            for (i, &x) in s.iter().enumerate() {
+                assert_eq!(i + 1, x);
+            }
+            assert_eq!(expected_sum, s.iter().sum());
+        };
+        scope(|s| {
+            s.spawn(append_1000);
+            s.spawn(append_1000);
+            s.spawn(append_1000);
+            s.spawn(|| {
+                for _ in 0..100 {
+                    check_sum();
+                }
+            });
+        });
+        check_sum();
     }
     #[test]
     fn snapshot_check() {
-        let transactor: Transactor<PersVec<usize, 4>> = Transactor::new(PersVec::new().append(1));
+        let mut transactor: Transactor<PersVec<usize, 4>> =
+            Transactor::new(PersVec::new().append(1));
         {
             let snapshot = transactor.snapshot();
             scope(|s| {
@@ -339,7 +382,7 @@ mod tests {
             assert_eq!(snapshot.len(), 1);
             assert_eq!(snapshot.first().unwrap(), &1);
         }
-        assert!(transactor.clear_history());
+        transactor.clear_history();
         assert_eq!(*transactor.snapshot().first().unwrap(), 1);
         assert_eq!(*transactor.snapshot().last().unwrap(), 2);
         assert_eq!(transactor.snapshot().len(), 2);
