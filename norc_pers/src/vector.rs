@@ -1,38 +1,27 @@
 use crate::{
+    BRANCH_FACTOR,
     alloc::{Allocator, Global},
     borrow::{PartialClone, Succeed},
     boxed::Box,
-    bytes, into_non_null,
+    into_non_null,
     node::{Node, PopPair},
 };
 use core::ops::Index;
 use core::{marker::PhantomData, sync::atomic::AtomicUsize};
 
 /// BRANCH_FACTOR must be a power of 2 and in [2, 256].
-pub struct PersVec<'a, T: 'a, const BRANCH_FACTOR: usize = 32, A: Allocator + Clone = Global>
-where
-    [(); bytes(BRANCH_FACTOR)]:,
-{
+pub struct PersVec<'a, T: 'a, A: Allocator + Clone = Global> {
     allocator: A,
     total_length: usize,
-    head: Node<BRANCH_FACTOR, T, A>,
-    tail: Node<BRANCH_FACTOR, T, A>, // tail always has values only
+    head: Node<T, A>,
+    tail: Node<T, A>, // tail always has values only
     id: usize,
     _borrow_lifetime: PhantomData<&'a T>,
 }
 
-unsafe impl<const B: usize, T: Sync, A: Allocator + Clone> Send for PersVec<'_, T, B, A> where
-    [(); bytes(B)]:
-{
-}
-unsafe impl<const B: usize, T: Sync, A: Allocator + Clone> Sync for PersVec<'_, T, B, A> where
-    [(); bytes(B)]:
-{
-}
-impl<'a, const B: usize, T: 'a, A: Allocator + Clone> Drop for PersVec<'a, T, B, A>
-where
-    [(); bytes(B)]:,
-{
+unsafe impl<T: Sync, A: Allocator + Clone> Send for PersVec<'_, T, A> {}
+unsafe impl<T: Sync, A: Allocator + Clone> Sync for PersVec<'_, T, A> {}
+impl<'a, T: 'a, A: Allocator + Clone> Drop for PersVec<'a, T, A> {
     fn drop(&mut self) {
         self.tail.drop_node(
             Self::tail_length(self.total_length),
@@ -46,69 +35,59 @@ where
         );
     }
 }
-impl<const B: usize, T, A: Allocator + Clone + Default> PersVec<'static, T, B, A>
-where
-    [(); bytes(B)]:,
-{
+impl<T, A: Allocator + Clone + Default> PersVec<'static, T, A> {
     pub fn new() -> Self {
         PersVec::new_in(A::default())
     }
 }
 static ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
-impl<const B: usize, T, A: Allocator + Clone> PersVec<'static, T, B, A>
-where
-    [(); bytes(B)]:,
-{
+impl<T, A: Allocator + Clone> PersVec<'static, T, A> {
     pub fn new_in(allocator: A) -> Self {
-        assert!(2usize.pow(B.ilog2()) == B);
+        assert!(2usize.pow(BRANCH_FACTOR.ilog2()) == BRANCH_FACTOR);
         Self {
             allocator,
             total_length: 0,
-            head: Node::<B, T, A>::empty(),
-            tail: Node::<B, T, A>::empty(),
+            head: Node::<T, A>::empty(),
+            tail: Node::<T, A>::empty(),
             id: ID_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
             _borrow_lifetime: PhantomData,
         }
     }
 }
-impl<'a, const B: usize, T, A: Allocator + Clone> PersVec<'a, T, B, A>
-where
-    [(); bytes(B)]:,
-{
+impl<'a, T, A: Allocator + Clone> PersVec<'a, T, A> {
     ///```
-    /// #![feature(generic_const_exprs)]
     /// use norc_pers::PersVec;
-    /// for i in 69..=260 {
-    ///     assert_eq!(PersVec::<u8, 4>::depth(i), 3);
+    /// for i in 4113..=65552 {
+    ///     assert_eq!(PersVec::<u8>::depth(i), 3);
     /// }
-    /// for i in 21..=68 {
-    ///     assert_eq!(PersVec::<u8, 4>::depth(i), 2);
+    /// for i in 273..=4112 {
+    ///     assert_eq!(PersVec::<u8>::depth(i), 2);
     /// }
-    /// for i in 9..=20 {
-    ///     assert_eq!(PersVec::<u8, 4>::depth(i), 1);
+    /// for i in 33..=272 {
+    ///     assert_eq!(PersVec::<u8>::depth(i), 1);
     /// }
-    /// for i in 0..=8 {
-    ///     assert_eq!(PersVec::<u8, 4>::depth(i), 0);
+    /// for i in 0..=32 {
+    ///     assert_eq!(PersVec::<u8>::depth(i), 0);
     /// }
     ///```
     pub fn depth(length: usize) -> u32 {
-        if length <= B {
+        if length <= BRANCH_FACTOR {
             0
         } else {
-            (length - Self::tail_length(length) - 1).ilog(B)
+            (length - Self::tail_length(length) - 1).ilog(BRANCH_FACTOR)
         }
     }
     fn tail_length(length: usize) -> usize {
-        let mod_b = length % B;
+        let mod_b = length % BRANCH_FACTOR;
         if length == 0 {
             0
         } else if mod_b == 0 {
-            B
+            BRANCH_FACTOR
         } else {
             mod_b
         }
     }
-    pub fn iter<'c>(&'c self) -> IterPersVec<'c, T, B, A> {
+    pub fn iter<'c>(&'c self) -> IterPersVec<'c, T, A> {
         IterPersVec {
             front: 0,
             back: self.len(),
@@ -122,7 +101,6 @@ where
         self.len() == 0
     }
     ///```compile_fail
-    /// #![feature(generic_const_exprs)]
     /// use norc_pers::PersVec;
     /// let new: PersVec<char> = PersVec::new().append('c');
     /// let first = new.get(0);
@@ -133,13 +111,13 @@ where
         if idx >= self.total_length {
             return None;
         }
-        if idx / B == (self.total_length - 1) / B {
-            let idx = (idx % B) as u8;
+        if idx / BRANCH_FACTOR == (self.total_length - 1) / BRANCH_FACTOR {
+            let idx = (idx % BRANCH_FACTOR) as u8;
             return Some(unsafe { self.tail.branches.values.get(idx).unwrap().as_ref() });
         }
         let depth = Self::depth(self.total_length);
-        let bits_needed = B.ilog2();
-        let mask = B - 1;
+        let bits_needed = BRANCH_FACTOR.ilog2();
+        let mask = BRANCH_FACTOR - 1;
         let mut node = &self.head;
         for i in (1..(depth + 1)).map(|x| x * bits_needed).rev() {
             let idx = idx >> i;
@@ -161,8 +139,8 @@ where
         if idx >= self.total_length {
             return self;
         }
-        if idx / B == (self.total_length - 1) / B {
-            let idx = (idx % B) as u8;
+        if idx / BRANCH_FACTOR == (self.total_length - 1) / BRANCH_FACTOR {
+            let idx = (idx % BRANCH_FACTOR) as u8;
             if self.tail.owned_branches.get_mut().get(idx as usize) {
                 unsafe {
                     *(*self.tail.branches.values)
@@ -180,8 +158,8 @@ where
             }
         } else {
             let depth = Self::depth(self.total_length);
-            let bits_needed = B.ilog2();
-            let mask = B - 1;
+            let bits_needed = BRANCH_FACTOR.ilog2();
+            let mask = BRANCH_FACTOR - 1;
             let mut node = &mut self.head;
             for i in (1..(depth + 1)).map(|x| x * bits_needed).rev() {
                 let idx = idx >> i;
@@ -227,13 +205,15 @@ where
     fn append_mut(&mut self, value: T) {
         let tail_length = Self::tail_length(self.total_length);
 
-        let mut tail = core::mem::replace(&mut self.tail, Node::<B, T, A>::empty());
-        if tail_length == B {
-            let tail = core::mem::replace(&mut tail, Node::<B, T, A>::empty());
-            let head = core::mem::replace(&mut self.head, Node::<B, T, A>::empty());
+        let mut tail = core::mem::replace(&mut self.tail, Node::<T, A>::empty());
+        if tail_length == BRANCH_FACTOR {
+            let tail = core::mem::replace(&mut tail, Node::<T, A>::empty());
+            let head = core::mem::replace(&mut self.head, Node::<T, A>::empty());
             let depth = Self::depth(self.total_length);
             let length_without_tail = self.total_length - tail_length;
-            let head = if length_without_tail > 1 && B.pow(depth + 1) == length_without_tail {
+            let head = if length_without_tail > 1
+                && BRANCH_FACTOR.pow(depth + 1) == length_without_tail
+            {
                 let result_node = Node::new_internal(head, self.allocator.clone());
                 let mut node = tail;
                 for _ in 0..depth {
@@ -245,7 +225,8 @@ where
             };
             self.head = head;
         }
-        self.tail = tail.branches_append_value(value, tail_length % B, self.allocator.clone());
+        self.tail =
+            tail.branches_append_value(value, tail_length % BRANCH_FACTOR, self.allocator.clone());
         self.total_length += 1;
     }
     #[must_use]
@@ -267,7 +248,7 @@ where
             let head = core::mem::replace(&mut self.head, Node::empty());
             if depth == 0 {
                 self.tail = head;
-            } else if B.pow(depth) == length_without_tail - B {
+            } else if BRANCH_FACTOR.pow(depth) == length_without_tail - BRANCH_FACTOR {
                 let PopPair { head, mut tail } = head.branches_pop_node(2, self.allocator.clone());
                 let PopPair { tail: head, .. } = head.branches_pop_node(1, self.allocator.clone());
                 for _ in 0..(depth - 1) {
@@ -293,9 +274,8 @@ where
         self
     }
 }
-impl<'a, const B: usize, T, A: Allocator + Clone> PersVec<'a, T, B, A>
+impl<'a, T, A: Allocator + Clone> PersVec<'a, T, A>
 where
-    [(); bytes(B)]:,
     T: PartialClone + Succeed,
 {
     /// If the given function returns `None`, or the given index is out of bounds,
@@ -307,8 +287,8 @@ where
         if idx >= self.total_length {
             return self;
         }
-        if idx / B == (self.total_length - 1) / B {
-            let idx = (idx % B) as u8;
+        if idx / BRANCH_FACTOR == (self.total_length - 1) / BRANCH_FACTOR {
+            let idx = (idx % BRANCH_FACTOR) as u8;
             let non_null_ref =
                 unsafe { (*self.tail.branches.values).get_mut(idx).as_mut().unwrap() };
             let Some(value) = f(unsafe { non_null_ref.as_ref() }) else {
@@ -330,8 +310,8 @@ where
             }
         } else {
             let depth = Self::depth(self.total_length);
-            let bits_needed = B.ilog2();
-            let mask = B - 1;
+            let bits_needed = BRANCH_FACTOR.ilog2();
+            let mask = BRANCH_FACTOR - 1;
             let mut node = &mut self.head;
             for i in (1..(depth + 1)).map(|x| x * bits_needed).rev() {
                 let idx = idx >> i;
@@ -388,18 +368,15 @@ where
         self.then_update_with(idx, |x| Some(f(x)))
     }
 }
-impl<const B: usize, T, A: Allocator + Clone> PartialClone for PersVec<'_, T, B, A>
-where
-    [(); bytes(B)]:,
-{
+impl<T, A: Allocator + Clone> PartialClone for PersVec<'_, T, A> {
     type Cloned<'a>
-        = PersVec<'a, T, B, A>
+        = PersVec<'a, T, A>
     where
         Self: 'a;
     fn partial_clone<'c>(&'c self) -> Self::Cloned<'c> {
         Self {
-            head: Node::<B, T, A>::partial_borrow(&self.head),
-            tail: Node::<B, T, A>::partial_borrow(&self.tail),
+            head: Node::<T, A>::partial_borrow(&self.head),
+            tail: Node::<T, A>::partial_borrow(&self.tail),
             allocator: self.allocator.clone(),
             ..*self
         }
@@ -412,10 +389,7 @@ where
     }
 }
 
-impl<const B: usize, T, A: Allocator + Clone> Succeed for PersVec<'_, T, B, A>
-where
-    [(); bytes(B)]:,
-{
+impl<T, A: Allocator + Clone> Succeed for PersVec<'_, T, A> {
     unsafe fn succeed<'c>(&'c self, clone: &Self::Cloned<'c>) {
         if self.id == clone.id && self.total_length != 0 && clone.total_length != 0 {
             let orig_depth = Self::depth(self.total_length);
@@ -435,7 +409,9 @@ where
 
             // AT ANY POINT IN TRAVERSAL IF WE ENCOUNTER A BORROWED NODE WE NEED NOT CONTINUE THERE
             // NO SUCCESSION ALLOWED PAST ANY BORROWS
-            if self.total_length.div_ceil(B) == clone.total_length.div_ceil(B) {
+            if self.total_length.div_ceil(BRANCH_FACTOR)
+                == clone.total_length.div_ceil(BRANCH_FACTOR)
+            {
                 // 1: self and clone are within same node boundary
                 //  =>  can directly succeed_nodes on head, and on tails with min(tail_lengths)
                 let orig_tail_length = Self::tail_length(self.total_length);
@@ -483,7 +459,7 @@ where
                         }
                     }
                 }
-            } else if min_length_without_tail / B == B.pow(min_depth) {
+            } else if min_length_without_tail / BRANCH_FACTOR == BRANCH_FACTOR.pow(min_depth) {
                 // 3: self and clone have different depths, and the shorter tree is "full",
                 //    that is, `length_without_tail(short) / B == B.pow(short_depth)`
                 //  =>  traverse down the leftmost nodes of the longer vector until at a depth of
@@ -597,19 +573,13 @@ where
     }
 }
 
-impl<const B: usize, T, A: Allocator + Clone + Default> Default for PersVec<'static, T, B, A>
-where
-    [(); bytes(B)]:,
-{
+impl<T, A: Allocator + Clone + Default> Default for PersVec<'static, T, A> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<const B: usize, T, A: Allocator + Clone> Index<usize> for PersVec<'_, T, B, A>
-where
-    [(); bytes(B)]:,
-{
+impl<T, A: Allocator + Clone> Index<usize> for PersVec<'_, T, A> {
     type Output = T;
 
     fn index(&self, index: usize) -> &Self::Output {
@@ -617,11 +587,7 @@ where
     }
 }
 
-impl<const B: usize, T, A: Allocator + Clone + Default> FromIterator<T>
-    for PersVec<'static, T, B, A>
-where
-    [(); bytes(B)]:,
-{
+impl<T, A: Allocator + Clone + Default> FromIterator<T> for PersVec<'static, T, A> {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
         let mut pv = PersVec::new_in(A::default());
         for t in iter {
@@ -631,19 +597,13 @@ where
     }
 }
 
-pub struct IterPersVec<'a, T, const B: usize, A: Allocator + Clone>
-where
-    [(); bytes(B)]:,
-{
+pub struct IterPersVec<'a, T, A: Allocator + Clone> {
     front: usize,
     back: usize,
-    vector: &'a PersVec<'a, T, B, A>,
+    vector: &'a PersVec<'a, T, A>,
 }
 
-impl<'a, const B: usize, T, A: Allocator + Clone> Iterator for IterPersVec<'a, T, B, A>
-where
-    [(); bytes(B)]:,
-{
+impl<'a, T, A: Allocator + Clone> Iterator for IterPersVec<'a, T, A> {
     // TODO could pop items, or just chain iterators of branches for impl, will bm this and ensure
     // we get iter extension traits
     type Item = &'a T;
@@ -668,10 +628,7 @@ where
         (size, Some(size))
     }
 }
-impl<const B: usize, T, A: Allocator + Clone> DoubleEndedIterator for IterPersVec<'_, T, B, A>
-where
-    [(); bytes(B)]:,
-{
+impl<T, A: Allocator + Clone> DoubleEndedIterator for IterPersVec<'_, T, A> {
     // these unsafes are fine to extend the lifetime of element borrows
     // since vector cant be mutated or taken once it enters the iterator
     fn next_back(&mut self) -> Option<Self::Item> {
@@ -686,10 +643,7 @@ where
         self.next_back()
     }
 }
-impl<const B: usize, T, A: Allocator + Clone> ExactSizeIterator for IterPersVec<'_, T, B, A> where
-    [(); bytes(B)]:
-{
-}
+impl<T, A: Allocator + Clone> ExactSizeIterator for IterPersVec<'_, T, A> {}
 
 #[cfg(test)]
 mod tests {
@@ -698,7 +652,7 @@ mod tests {
 
     #[test]
     fn it_works() {
-        let new: PersVec<char, 8> = PersVec::new().append('c').append('h');
+        let new: PersVec<char> = PersVec::new().append('c').append('h');
 
         assert_eq!(new.get(0), Some(&'c'));
         assert_eq!(new.get(1), Some(&'h'));
@@ -722,7 +676,7 @@ mod tests {
 
     #[test]
     fn borrow_test() {
-        let new: PersVec<char, 8> = pers_vec!['c', 'h'];
+        let new: PersVec<char> = pers_vec!['c', 'h'];
         {
             let next = new.partial_clone();
             assert_eq!(next.get(1), Some(&'h'));
@@ -736,7 +690,7 @@ mod tests {
     }
     #[test]
     fn tree_follow() {
-        let mut pers: PersVec<isize, 4> = pers_vec![];
+        let mut pers: PersVec<isize> = pers_vec![];
 
         for i in 0..100 {
             pers = pers.append(i);
@@ -788,7 +742,7 @@ mod tests {
     }
     #[test]
     fn succeed_update() {
-        let mut new: PersVec<PersVec<usize, 2>, 2> = pers_vec![];
+        let mut new: PersVec<PersVec<usize>> = pers_vec![];
         for _ in 0..10 {
             new = new.append(PersVec::new());
         }
@@ -856,7 +810,7 @@ mod tests {
     }
     #[test]
     fn many_succeed() {
-        let mut new: PersVec<usize, 4> = pers_vec![];
+        let mut new: PersVec<usize> = pers_vec![];
         for i in 0..100 {
             let clone = new.partial_clone().append(i);
             unsafe { new.succeed(&clone) };
@@ -869,7 +823,7 @@ mod tests {
     }
     #[test]
     fn succeed_ancestors_proper() {
-        let mut family: Vec<PersVec<usize, 4>> = vec![pers_vec![]];
+        let mut family: Vec<PersVec<usize>> = vec![pers_vec![]];
         for i in 0..100 {
             let new_child =
                 unsafe { PartialClone::extend_inner_lifetime(family[i].partial_clone().append(i)) };
@@ -884,7 +838,7 @@ mod tests {
             assert_eq!(el, i);
         }
 
-        let mut family: Vec<PersVec<usize, 4>> = vec![last];
+        let mut family: Vec<PersVec<usize>> = vec![last];
         for i in 0..100 {
             let new_child =
                 unsafe { PartialClone::extend_inner_lifetime(family[i].partial_clone().pop()) };

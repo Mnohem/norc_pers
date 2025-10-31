@@ -1,15 +1,15 @@
-use crate::{BitArray, alloc::Allocator, boxed::Box, bytes, into_non_null};
+use crate::{BRANCH_FACTOR, BitArray, alloc::Allocator, boxed::Box, into_non_null};
 use core::{cell::UnsafeCell, marker::PhantomData, mem::ManuallyDrop, ops::Range, ptr::NonNull};
 
-pub(crate) struct Branches<const BRANCH_FACTOR: usize, T> {
+pub(crate) struct Branches<T> {
     array: [Option<NonNull<T>>; BRANCH_FACTOR],
 }
-impl<const B: usize, T> Branches<B, T> {
+impl<T> Branches<T> {
     pub(crate) const fn none() -> ManuallyDrop<Self> {
-        ManuallyDrop::new(Branches { array: [None; B] })
+        ManuallyDrop::new(Branches { array: [None; _] })
     }
     pub(crate) fn first(value: NonNull<T>) -> ManuallyDrop<Self> {
-        let mut array = [None; B];
+        let mut array = [None; BRANCH_FACTOR];
         array[0] = Some(value);
         ManuallyDrop::new(Branches { array })
     }
@@ -47,40 +47,28 @@ impl<const B: usize, T> Branches<B, T> {
         }
     }
 }
-pub(crate) union AmbiguousBranches<const B: usize, T, A: Allocator + Clone>
-where
-    [(); bytes(B)]:,
-{
-    pub values: ManuallyDrop<Branches<B, T>>,
-    pub nodes: ManuallyDrop<Branches<B, Node<B, T, A>>>,
+pub(crate) union AmbiguousBranches<T, A: Allocator + Clone> {
+    pub values: ManuallyDrop<Branches<T>>,
+    pub nodes: ManuallyDrop<Branches<Node<T, A>>>,
     _phantom: PhantomData<A>,
 }
 
-pub(crate) struct Node<const B: usize, T, A: Allocator + Clone>
-where
-    [(); bytes(B)]:,
-{
-    pub owned_branches: UnsafeCell<BitArray<B>>, // UnsafeCell here allows us to impl succeed_nodes
+pub(crate) struct Node<T, A: Allocator + Clone> {
+    pub owned_branches: UnsafeCell<BitArray>, // UnsafeCell here allows us to impl succeed_nodes
     // on refs, since sharing will still be valid
     // during succession
-    pub branches: AmbiguousBranches<B, T, A>,
+    pub branches: AmbiguousBranches<T, A>,
 }
 
-pub(crate) struct PopPair<const B: usize, T, A: Allocator + Clone>
-where
-    [(); bytes(B)]:,
-{
-    pub head: Node<B, T, A>,
-    pub tail: Node<B, T, A>,
+pub(crate) struct PopPair<T, A: Allocator + Clone> {
+    pub head: Node<T, A>,
+    pub tail: Node<T, A>,
 }
-impl<const B: usize, T, A: Allocator + Clone> Node<B, T, A>
-where
-    [(); bytes(B)]:,
-{
+impl<T, A: Allocator + Clone> Node<T, A> {
     pub(crate) const fn empty() -> Self {
         Self {
             owned_branches: UnsafeCell::new(BitArray::new()),
-            branches: AmbiguousBranches::<B, T, A> {
+            branches: AmbiguousBranches::<T, A> {
                 values: Branches::none(),
             },
         }
@@ -93,14 +81,14 @@ where
         owned_branches.set(0);
         Self {
             owned_branches: UnsafeCell::new(owned_branches),
-            branches: AmbiguousBranches::<B, T, A> { values },
+            branches: AmbiguousBranches::<T, A> { values },
         }
     }
     pub(crate) fn _new_leaf_ref(initial_ref: &T) -> Self {
         let values = Branches::first(NonNull::from_ref(initial_ref));
         Self {
             owned_branches: UnsafeCell::new(BitArray::new()),
-            branches: AmbiguousBranches::<B, T, A> { values },
+            branches: AmbiguousBranches::<T, A> { values },
         }
     }
     pub(crate) fn new_internal(child_node: Self, allocator: A) -> Self {
@@ -111,7 +99,7 @@ where
         owned_branches.set(0);
         Self {
             owned_branches: UnsafeCell::new(owned_branches),
-            branches: AmbiguousBranches::<B, T, A> { nodes },
+            branches: AmbiguousBranches::<T, A> { nodes },
         }
     }
     pub(crate) fn partial_borrow(&self) -> Self {
@@ -121,7 +109,7 @@ where
         }
     }
     pub(crate) fn branches_append_value(mut self, value: T, length: usize, allocator: A) -> Self {
-        debug_assert!(length < B);
+        debug_assert!(length < BRANCH_FACTOR);
         unsafe {
             debug_assert!((*self.branches.values).append(
                 length as u8,
@@ -132,7 +120,7 @@ where
         self
     }
     pub(crate) fn branches_pop_value(mut self, length: usize, allocator: A) -> Self {
-        debug_assert!(length <= B);
+        debug_assert!(length <= BRANCH_FACTOR);
         let value = unsafe { (*self.branches.values).pop(length as u8) };
         debug_assert!(value.is_some());
         if self.owned_branches.get_mut().get(length - 1) {
@@ -142,7 +130,7 @@ where
         self
     }
     pub(crate) fn branches_append_node(mut self, node: Self, length: usize, allocator: A) -> Self {
-        debug_assert!(length < B);
+        debug_assert!(length < BRANCH_FACTOR);
         unsafe {
             debug_assert!((*self.branches.nodes).append(
                 length as u8,
@@ -152,8 +140,8 @@ where
         self.owned_branches.get_mut().set(length);
         self
     }
-    pub(crate) fn branches_pop_node(mut self, length: usize, allocator: A) -> PopPair<B, T, A> {
-        debug_assert!(length <= B);
+    pub(crate) fn branches_pop_node(mut self, length: usize, allocator: A) -> PopPair<T, A> {
+        debug_assert!(length <= BRANCH_FACTOR);
         let node = unsafe { (*self.branches.nodes).pop(length as u8) }.unwrap();
         PopPair {
             tail: if self.owned_branches.get_mut().get(length - 1) {
@@ -166,7 +154,7 @@ where
         }
     }
     pub(crate) fn drop_node(&mut self, length: usize, depth: u32, allocator: A) {
-        let branches_amount = length.div_ceil(B.pow(depth)) as u8;
+        let branches_amount = length.div_ceil(BRANCH_FACTOR.pow(depth)) as u8;
         if depth == 0 {
             for (i, value) in unsafe { (*self.branches.values).range_mut(0..branches_amount) }
                 .iter()
@@ -182,7 +170,7 @@ where
                 }
             }
         } else {
-            let next_length = B.pow(depth);
+            let next_length = BRANCH_FACTOR.pow(depth);
             for (i, node) in unsafe { (*self.branches.nodes).range_mut(0..branches_amount) }
                 .iter_mut()
                 .enumerate()
@@ -225,22 +213,22 @@ where
         depth: u32,
         allocator: A,
     ) -> Self {
-        let next_length = length_without_tail % B.pow(depth);
+        let next_length = length_without_tail % BRANCH_FACTOR.pow(depth);
         if depth == 0 {
             debug_assert_eq!(length_without_tail, 0);
             tail
         } else if depth == 1 {
-            self.branches_append_node(tail, length_without_tail / B, allocator)
+            self.branches_append_node(tail, length_without_tail / BRANCH_FACTOR, allocator)
         } else if next_length == 0 {
             // add a new node with the correct depth
             let mut node = tail;
             for _ in 0..(depth - 1) {
                 node = Node::new_internal(node, allocator.clone());
             }
-            let branches_amount = length_without_tail / B.pow(depth);
+            let branches_amount = length_without_tail / BRANCH_FACTOR.pow(depth);
             self.branches_append_node(node, branches_amount, allocator.clone())
         } else {
-            let branches_amount = length_without_tail.div_ceil(B.pow(depth)) as u8;
+            let branches_amount = length_without_tail.div_ceil(BRANCH_FACTOR.pow(depth)) as u8;
             let node = unsafe { (*self.branches.nodes).unchecked_range_mut(0..branches_amount) }
                 .last_mut()
                 .unwrap();
@@ -281,25 +269,25 @@ where
         length: usize,
         depth: u32,
         allocator: A,
-    ) -> PopPair<B, T, A> {
+    ) -> PopPair<T, A> {
         debug_assert!(depth > 0);
-        let next_length = length % B.pow(depth);
+        let next_length = length % BRANCH_FACTOR.pow(depth);
         let next_length = if next_length == 0 {
-            B.pow(depth)
+            BRANCH_FACTOR.pow(depth)
         } else {
             next_length
         };
         if depth == 1 {
-            self.branches_pop_node(length / B, allocator)
-        } else if next_length == B {
-            let PopPair { head, mut tail } =
-                self.branches_pop_node(length.div_ceil(B.pow(depth)), allocator.clone());
+            self.branches_pop_node(length / BRANCH_FACTOR, allocator)
+        } else if next_length == BRANCH_FACTOR {
+            let PopPair { head, mut tail } = self
+                .branches_pop_node(length.div_ceil(BRANCH_FACTOR.pow(depth)), allocator.clone());
             for _ in 0..(depth - 1) {
                 PopPair { tail, .. } = tail.branches_pop_node(1, allocator.clone());
             }
             PopPair { head, tail }
         } else {
-            let branches_amount = length.div_ceil(B.pow(depth));
+            let branches_amount = length.div_ceil(BRANCH_FACTOR.pow(depth));
             let node = unsafe { (*self.branches.nodes).get_mut((branches_amount - 1) as u8) }
                 .as_mut()
                 .expect("Null pointer");
@@ -326,13 +314,13 @@ where
     }
     // after this call, self will be the borrower of all shared values and clone will be the owner
     pub(crate) unsafe fn succeed_nodes(&self, clone: &Self, length: usize, depth: u32) {
-        let branch_length = length.div_ceil(B.pow(depth));
+        let branch_length = length.div_ceil(BRANCH_FACTOR.pow(depth));
 
         let self_owned_flags = unsafe { self.owned_branches.get().read() };
         let clone_owned_flags = unsafe { clone.owned_branches.get().read() };
         let mut new_owner_flags = self_owned_flags.or(clone_owned_flags);
         let mut new_borrower_flags = self_owned_flags.and(clone_owned_flags);
-        for i in branch_length..B {
+        for i in branch_length..BRANCH_FACTOR {
             new_owner_flags.update(i, clone_owned_flags.get(i));
             new_borrower_flags.update(i, self_owned_flags.get(i));
         }
@@ -347,7 +335,7 @@ where
         for i in 0..branch_length {
             // TODO optimize loop condition
             if new_borrower_flags.get(i) {
-                let next_full_length = B.pow(depth);
+                let next_full_length = BRANCH_FACTOR.pow(depth);
                 let next_length = if i == branch_length - 1 {
                     let tmp = length % next_full_length;
                     if tmp == 0 { next_full_length } else { tmp }
@@ -375,7 +363,7 @@ where
         self_tail_substitute: &Self,
         tail_length: usize,
     ) {
-        let next_full_length = B.pow(depth);
+        let next_full_length = BRANCH_FACTOR.pow(depth);
         let branch_length = length_without_tail.div_ceil(next_full_length);
 
         let self_owned_flags = unsafe { self.owned_branches.get().read() };
@@ -383,7 +371,7 @@ where
         let mut new_owner_flags = self_owned_flags.or(clone_owned_flags);
         let mut new_borrower_flags = self_owned_flags.and(clone_owned_flags);
 
-        for i in branch_length..B {
+        for i in branch_length..BRANCH_FACTOR {
             new_borrower_flags.update(i, self_owned_flags.get(i));
             new_owner_flags.update(i, clone_owned_flags.get(i));
         }
@@ -473,7 +461,7 @@ where
         clone_tail_substitute: &Self,
         tail_length: usize,
     ) {
-        let next_full_length = B.pow(depth);
+        let next_full_length = BRANCH_FACTOR.pow(depth);
         let branch_length = length_without_tail.div_ceil(next_full_length);
 
         let self_owned_flags = unsafe { self.owned_branches.get().read() };
@@ -481,7 +469,7 @@ where
         let mut new_owner_flags = self_owned_flags.or(clone_owned_flags);
         let mut new_borrower_flags = self_owned_flags.and(clone_owned_flags);
 
-        for i in branch_length..B {
+        for i in branch_length..BRANCH_FACTOR {
             new_borrower_flags.update(i, self_owned_flags.get(i));
             new_owner_flags.update(i, clone_owned_flags.get(i));
         }

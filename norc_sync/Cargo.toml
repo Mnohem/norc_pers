@@ -11,3 +11,6 @@ norc_pers = { path = "../norc_pers" }
 [features]
 default = ["std"]
 std = []
+
+[dev-dependencies]
+smol = "2.0.2"

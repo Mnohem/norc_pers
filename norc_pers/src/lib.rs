@@ -1,9 +1,7 @@
-#![expect(incomplete_features)]
 #![feature(set_ptr_value)]
 #![feature(layout_for_ptr)]
 #![feature(unsize)]
 #![feature(maybe_uninit_slice)]
-#![feature(generic_const_exprs)]
 #![feature(box_into_inner)]
 #![feature(ptr_as_uninit)]
 #![feature(breakpoint)]
@@ -89,43 +87,40 @@ where
         self.deref()
     }
 }
-pub const fn bytes(n: usize) -> usize {
+const fn bytes(n: usize) -> usize {
     n.div_ceil(8)
 }
+
+pub const BRANCH_FACTOR: usize = 16;
 #[derive(Clone, Copy)]
-pub struct BitArray<const N: usize>([u8; bytes(N)])
-where
-    [(); bytes(N)]:;
-impl<const N: usize> BitArray<N>
-where
-    [(); bytes(N)]:,
-{
+pub struct BitArray([u8; bytes(BRANCH_FACTOR)]);
+impl BitArray {
     pub const fn new() -> Self {
         Self([0; _])
     }
     pub fn get(&self, idx: usize) -> bool {
-        assert!(idx < N);
+        assert!(idx < BRANCH_FACTOR);
         let byte_idx = idx / 8;
         let bit_idx = 7 - (idx % 8);
         let mask = 1 << bit_idx;
         mask & self.0[byte_idx] != 0
     }
     pub fn set(&mut self, idx: usize) {
-        assert!(idx < N);
+        assert!(idx < BRANCH_FACTOR);
         let byte_idx = idx / 8;
         let bit_idx = 7 - (idx % 8);
         let mask = 1 << bit_idx;
         self.0[byte_idx] |= mask;
     }
     pub fn unset(&mut self, idx: usize) {
-        assert!(idx < N);
+        assert!(idx < BRANCH_FACTOR);
         let byte_idx = idx / 8;
         let bit_idx = 7 - (idx % 8);
         let mask = 1 << bit_idx;
         self.0[byte_idx] &= !mask;
     }
     pub fn toggle(&mut self, idx: usize) {
-        assert!(idx < N);
+        assert!(idx < BRANCH_FACTOR);
         let byte_idx = idx / 8;
         let bit_idx = 7 - (idx % 8);
         let mask = 1 << bit_idx;
@@ -140,14 +135,14 @@ where
     }
     pub fn or(self, other: Self) -> Self {
         let mut result = Self::new();
-        for i in 0..bytes(N) {
+        for i in 0..bytes(BRANCH_FACTOR) {
             result.0[i] = self.0[i] | other.0[i];
         }
         result
     }
     pub fn and(self, other: Self) -> Self {
         let mut result = Self::new();
-        for i in 0..bytes(N) {
+        for i in 0..bytes(BRANCH_FACTOR) {
             result.0[i] = self.0[i] & other.0[i];
         }
         result
