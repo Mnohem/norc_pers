@@ -294,10 +294,10 @@ mod tests {
         assert_eq!(new.first(), Some([1, 1, 1].as_slice()));
 
         let mut sum = 0;
-        for i in iterator.map(<[i32]>::iter).flatten() {
+        for i in iterator.flat_map(<[i32]>::iter) {
             sum += i;
         }
-        assert_eq!(sum, 3 * 76 + 2 + 3 * 1);
+        assert_eq!(sum, 3 * 76 + 2 + 1 + 1 + 1);
     }
     #[test]
     fn dyn_test() {

@@ -1,10 +1,9 @@
 #![feature(set_ptr_value)]
 #![feature(layout_for_ptr)]
 #![feature(unsize)]
-#![feature(maybe_uninit_slice)]
 #![feature(box_into_inner)]
 #![feature(ptr_as_uninit)]
-#![feature(breakpoint)]
+#![feature(iter_array_chunks)]
 #![cfg_attr(not(any(test, feature = "std")), no_std)]
 #![cfg_attr(not(feature = "allocator-api2"), feature(allocator_api))]
 
@@ -16,7 +15,7 @@ mod vector;
 pub use list::List;
 pub use vector::PersVec;
 
-use core::{ops::Deref, ptr::NonNull};
+pub use core::{ops::Deref, ptr::NonNull};
 
 cfg_if::cfg_if! {
     if #[cfg(feature = "allocator-api2")] {
@@ -95,7 +94,7 @@ pub const BRANCH_FACTOR: usize = 16;
 #[derive(Clone, Copy)]
 pub struct BitArray([u8; bytes(BRANCH_FACTOR)]);
 impl BitArray {
-    pub const fn new() -> Self {
+    pub const fn zeroes() -> Self {
         Self([0; _])
     }
     pub fn get(&self, idx: usize) -> bool {
@@ -134,17 +133,22 @@ impl BitArray {
         }
     }
     pub fn or(self, other: Self) -> Self {
-        let mut result = Self::new();
+        let mut result = Self::zeroes();
         for i in 0..bytes(BRANCH_FACTOR) {
             result.0[i] = self.0[i] | other.0[i];
         }
         result
     }
     pub fn and(self, other: Self) -> Self {
-        let mut result = Self::new();
+        let mut result = Self::zeroes();
         for i in 0..bytes(BRANCH_FACTOR) {
             result.0[i] = self.0[i] & other.0[i];
         }
         result
+    }
+}
+impl Default for BitArray {
+    fn default() -> Self {
+        Self::zeroes()
     }
 }

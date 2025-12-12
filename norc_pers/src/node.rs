@@ -1,101 +1,89 @@
-use crate::{BRANCH_FACTOR, BitArray, alloc::Allocator, boxed::Box, into_non_null};
-use core::{cell::UnsafeCell, marker::PhantomData, mem::ManuallyDrop, ops::Range, ptr::NonNull};
+use crate::{
+    BRANCH_FACTOR, BitArray,
+    alloc::Allocator,
+    borrow::{Consign, Lend, WordAddress},
+    boxed::Box,
+    into_non_null,
+};
+use core::{
+    cell::UnsafeCell,
+    marker::PhantomData,
+    mem::ManuallyDrop,
+    ops::Range,
+    ptr::{self, NonNull},
+};
 
-pub(crate) struct Branches<T> {
-    array: [Option<NonNull<T>>; BRANCH_FACTOR],
+pub(crate) struct Branches<T: WordAddress> {
+    array: [*const T::Pointee; BRANCH_FACTOR],
 }
-impl<T> Branches<T> {
+impl<T: WordAddress> Branches<T> {
     pub(crate) const fn none() -> ManuallyDrop<Self> {
-        ManuallyDrop::new(Branches { array: [None; _] })
+        ManuallyDrop::new(Branches {
+            array: [ptr::null(); _],
+        })
     }
-    pub(crate) fn first(value: NonNull<T>) -> ManuallyDrop<Self> {
-        let mut array = [None; BRANCH_FACTOR];
-        array[0] = Some(value);
+    pub(crate) fn first(value: *const T::Pointee) -> ManuallyDrop<Self> {
+        let mut array = [ptr::null(); BRANCH_FACTOR];
+        array[0] = value;
         ManuallyDrop::new(Branches { array })
     }
-    pub(crate) fn append(&mut self, len: u8, value: NonNull<T>) -> bool {
-        self.array
-            .get_mut(len as usize)
-            .map(|x| *x = Some(value))
-            .is_some()
+    pub(crate) fn append(&mut self, len: u8, value: T) {
+        self.set(len, value);
     }
-    pub(crate) fn pop(&mut self, len: u8) -> Option<NonNull<T>> {
-        self.array
-            .get_mut(len.checked_sub(1)? as usize)
-            .and_then(|x| x.take())
+    pub(crate) fn pop(&mut self, len: u8) -> *const T::Pointee {
+        core::mem::replace(&mut self.array[len as usize - 1], ptr::null())
     }
-    pub(crate) fn get(&self, idx: u8) -> Option<NonNull<T>> {
-        self.array[idx as usize]
+    pub(crate) fn get(&self, idx: u8) -> &*const T::Pointee {
+        &self.array[idx as usize]
     }
-    pub(crate) fn get_mut(&mut self, idx: u8) -> &mut Option<NonNull<T>> {
+    // put value in array without dropping
+    pub(crate) fn set(&mut self, idx: u8, value: T) {
+        self.array[idx as usize] = value.into_addr();
+    }
+    pub(crate) fn set_by_ptr(&mut self, idx: u8, p: *const T::Pointee) {
+        self.array[idx as usize] = p;
+    }
+    pub(crate) fn get_mut(&mut self, idx: u8) -> &mut *const T::Pointee {
         &mut self.array[idx as usize]
     }
-    pub(crate) fn range_mut(&mut self, r: Range<u8>) -> &mut [Option<NonNull<T>>] {
+    pub(crate) fn range_mut(&mut self, r: Range<u8>) -> &mut [*const T::Pointee] {
         &mut self.array[Range {
             start: r.start as usize,
             end: r.end as usize,
         }]
     }
-    pub(crate) unsafe fn unchecked_range_mut(&mut self, r: Range<u8>) -> &mut [NonNull<T>] {
-        unsafe {
-            core::mem::transmute(
-                &mut self.array[Range {
-                    start: r.start as usize,
-                    end: r.end as usize,
-                }],
-            )
-        }
-    }
 }
-pub(crate) union AmbiguousBranches<T, A: Allocator + Clone> {
+pub(crate) union AmbiguousBranches<T: WordAddress, A: Allocator + Clone> {
     pub values: ManuallyDrop<Branches<T>>,
-    pub nodes: ManuallyDrop<Branches<Node<T, A>>>,
+    pub nodes: ManuallyDrop<Branches<Option<NonNull<Node<T, A>>>>>,
     _phantom: PhantomData<A>,
 }
 
-pub(crate) struct Node<T, A: Allocator + Clone> {
+pub(crate) struct Node<T: WordAddress, A: Allocator + Clone> {
     pub owned_branches: UnsafeCell<BitArray>, // UnsafeCell here allows us to impl succeed_nodes
     // on refs, since sharing will still be valid
     // during succession
     pub branches: AmbiguousBranches<T, A>,
 }
 
-pub(crate) struct PopPair<T, A: Allocator + Clone> {
+pub(crate) struct PopPair<T: WordAddress, A: Allocator + Clone> {
     pub head: Node<T, A>,
     pub tail: Node<T, A>,
 }
-impl<T, A: Allocator + Clone> Node<T, A> {
+impl<T: WordAddress, A: Allocator + Clone> Node<T, A> {
     pub(crate) const fn empty() -> Self {
         Self {
-            owned_branches: UnsafeCell::new(BitArray::new()),
+            owned_branches: UnsafeCell::new(BitArray::zeroes()),
             branches: AmbiguousBranches::<T, A> {
                 values: Branches::none(),
             },
         }
     }
-    pub(crate) fn _new_leaf(initial_value: T, allocator: A) -> Self {
-        let values = Branches::first(unsafe {
-            into_non_null(Box::<T, A>::new_in(initial_value, allocator))
-        });
-        let mut owned_branches = BitArray::new();
-        owned_branches.set(0);
-        Self {
-            owned_branches: UnsafeCell::new(owned_branches),
-            branches: AmbiguousBranches::<T, A> { values },
-        }
-    }
-    pub(crate) fn _new_leaf_ref(initial_ref: &T) -> Self {
-        let values = Branches::first(NonNull::from_ref(initial_ref));
-        Self {
-            owned_branches: UnsafeCell::new(BitArray::new()),
-            branches: AmbiguousBranches::<T, A> { values },
-        }
-    }
     pub(crate) fn new_internal(child_node: Self, allocator: A) -> Self {
-        let nodes = Branches::first(unsafe {
-            into_non_null(Box::<Self, A>::new_in(child_node, allocator))
-        });
-        let mut owned_branches = BitArray::new();
+        let nodes = Branches::first(
+            Box::into_raw_with_allocator(Box::<Self, A>::new_in(child_node, allocator)).0,
+        );
+        let mut owned_branches = BitArray::zeroes();
         owned_branches.set(0);
         Self {
             owned_branches: UnsafeCell::new(owned_branches),
@@ -104,27 +92,21 @@ impl<T, A: Allocator + Clone> Node<T, A> {
     }
     pub(crate) fn partial_borrow(&self) -> Self {
         Self {
-            owned_branches: UnsafeCell::new(BitArray::new()),
+            owned_branches: UnsafeCell::new(BitArray::zeroes()),
             branches: unsafe { core::mem::transmute_copy(&self.branches) },
         }
     }
-    pub(crate) fn branches_append_value(mut self, value: T, length: usize, allocator: A) -> Self {
+    pub(crate) fn branches_append_value(mut self, value: T, length: usize) -> Self {
         debug_assert!(length < BRANCH_FACTOR);
-        unsafe {
-            debug_assert!((*self.branches.values).append(
-                length as u8,
-                into_non_null(Box::<T, A>::new_in(value, allocator)),
-            ))
-        }
+        unsafe { (*self.branches.values).append(length as u8, value) };
         self.owned_branches.get_mut().set(length);
         self
     }
-    pub(crate) fn branches_pop_value(mut self, length: usize, allocator: A) -> Self {
+    pub(crate) fn branches_pop_value(mut self, length: usize) -> Self {
         debug_assert!(length <= BRANCH_FACTOR);
         let value = unsafe { (*self.branches.values).pop(length as u8) };
-        debug_assert!(value.is_some());
         if self.owned_branches.get_mut().get(length - 1) {
-            drop(unsafe { Box::from_raw_in(value.unwrap_unchecked().as_ptr(), allocator) });
+            drop(unsafe { core::mem::transmute_copy::<T, T>(T::reform(&value)) });
             self.owned_branches.get_mut().unset(length - 1);
         }
         self
@@ -132,17 +114,18 @@ impl<T, A: Allocator + Clone> Node<T, A> {
     pub(crate) fn branches_append_node(mut self, node: Self, length: usize, allocator: A) -> Self {
         debug_assert!(length < BRANCH_FACTOR);
         unsafe {
-            debug_assert!((*self.branches.nodes).append(
+            (*self.branches.nodes).append(
                 length as u8,
-                into_non_null(Box::<Self, A>::new_in(node, allocator)),
-            ))
+                Some(into_non_null(Box::<Self, A>::new_in(node, allocator))),
+            );
         }
         self.owned_branches.get_mut().set(length);
         self
     }
     pub(crate) fn branches_pop_node(mut self, length: usize, allocator: A) -> PopPair<T, A> {
         debug_assert!(length <= BRANCH_FACTOR);
-        let node = unsafe { (*self.branches.nodes).pop(length as u8) }.unwrap();
+        let node =
+            NonNull::new(unsafe { (*self.branches.nodes).pop(length as u8) as *mut Self }).unwrap();
         PopPair {
             tail: if self.owned_branches.get_mut().get(length - 1) {
                 self.owned_branches.get_mut().unset(length - 1);
@@ -161,12 +144,7 @@ impl<T, A: Allocator + Clone> Node<T, A> {
                 .enumerate()
             {
                 if self.owned_branches.get_mut().get(i) {
-                    unsafe {
-                        drop(Box::<T, A>::from_raw_in(
-                            value.unwrap().as_ptr(),
-                            allocator.clone(),
-                        ))
-                    };
+                    drop(unsafe { core::mem::transmute_copy::<T, T>(T::reform(value)) });
                 }
             }
         } else {
@@ -175,6 +153,7 @@ impl<T, A: Allocator + Clone> Node<T, A> {
                 .iter_mut()
                 .enumerate()
             {
+                let boxed_node = *node as *mut _;
                 if i == branches_amount as usize - 1 && !length.is_multiple_of(next_length) {
                     if self
                         .owned_branches
@@ -182,7 +161,6 @@ impl<T, A: Allocator + Clone> Node<T, A> {
                         .get(branches_amount as usize - 1)
                     {
                         let last_length = length % next_length;
-                        let boxed_node = node.unwrap().as_ptr();
                         Self::drop_node(
                             &mut Box::<Self, A>::into_inner(unsafe {
                                 Box::<Self, A>::from_raw_in(boxed_node, allocator.clone())
@@ -193,7 +171,6 @@ impl<T, A: Allocator + Clone> Node<T, A> {
                         )
                     }
                 } else if self.owned_branches.get_mut().get(i) {
-                    let boxed_node = node.unwrap().as_ptr();
                     Self::drop_node(
                         &mut Box::<Self, A>::into_inner(unsafe {
                             Box::<Self, A>::from_raw_in(boxed_node, allocator.clone())
@@ -229,16 +206,14 @@ impl<T, A: Allocator + Clone> Node<T, A> {
             self.branches_append_node(node, branches_amount, allocator.clone())
         } else {
             let branches_amount = length_without_tail.div_ceil(BRANCH_FACTOR.pow(depth)) as u8;
-            let node = unsafe { (*self.branches.nodes).unchecked_range_mut(0..branches_amount) }
-                .last_mut()
-                .unwrap();
+            let node = unsafe { (*self.branches.nodes).get_mut(branches_amount - 1) };
             if self
                 .owned_branches
                 .get_mut()
                 .get(branches_amount as usize - 1)
             {
                 unsafe {
-                    node.write(node.read().vector_append_tail(
+                    (*node as *mut Self).write(node.read().vector_append_tail(
                         tail,
                         next_length,
                         depth - 1,
@@ -247,8 +222,8 @@ impl<T, A: Allocator + Clone> Node<T, A> {
                 };
             } else {
                 *node = unsafe {
-                    into_non_null(Box::<Self, A>::new_in(
-                        node.as_ref().partial_borrow().vector_append_tail(
+                    Box::into_raw_with_allocator(Box::<Self, A>::new_in(
+                        node.as_ref().unwrap().partial_borrow().vector_append_tail(
                             tail,
                             next_length,
                             depth - 1,
@@ -256,6 +231,7 @@ impl<T, A: Allocator + Clone> Node<T, A> {
                         ),
                         allocator.clone(),
                     ))
+                    .0
                 };
             }
             self.owned_branches
@@ -288,9 +264,7 @@ impl<T, A: Allocator + Clone> Node<T, A> {
             PopPair { head, tail }
         } else {
             let branches_amount = length.div_ceil(BRANCH_FACTOR.pow(depth));
-            let node = unsafe { (*self.branches.nodes).get_mut((branches_amount - 1) as u8) }
-                .as_mut()
-                .expect("Null pointer");
+            let node = unsafe { (*self.branches.nodes).get_mut((branches_amount - 1) as u8) };
             let tail;
             // TODO is everything dropped here?
             if self.owned_branches.get_mut().get(branches_amount - 1) {
@@ -300,18 +274,26 @@ impl<T, A: Allocator + Clone> Node<T, A> {
                     allocator.clone(),
                 );
                 tail = t;
-                unsafe { node.write(head) };
+                unsafe { (*node as *mut Self).write(head) };
             } else {
                 let PopPair { head, tail: t } = unsafe { node.as_ref() }
+                    .unwrap()
                     .partial_borrow()
                     .vector_pop_tail(next_length, depth - 1, allocator.clone());
                 tail = t;
-                *node = unsafe { into_non_null(Box::<Self, A>::new_in(head, allocator.clone())) };
+                *node =
+                    Box::into_raw_with_allocator(Box::<Self, A>::new_in(head, allocator.clone())).0;
                 self.owned_branches.get_mut().set(branches_amount - 1);
             }
             PopPair { head: self, tail }
         }
     }
+}
+
+impl<T: WordAddress, A: Allocator + Clone> Node<T, A>
+where
+    T::Pointee: Consign,
+{
     // after this call, self will be the borrower of all shared values and clone will be the owner
     pub(crate) unsafe fn succeed_nodes(&self, clone: &Self, length: usize, depth: u32) {
         let branch_length = length.div_ceil(BRANCH_FACTOR.pow(depth));
@@ -329,6 +311,31 @@ impl<T, A: Allocator + Clone> Node<T, A> {
             clone.owned_branches.get().write(new_owner_flags);
         }
         if depth == 0 {
+            for i in 0..branch_length {
+                // If clone owns this element, we attempt to consign
+                //  If self does not own their copy of this element, we could still lend it, so we
+                //  must attempt to consign
+                // If this element is independent from the element in self, consign will noop
+                if clone_owned_flags.get(i) {
+                    let idx = i as u8;
+                    let Some(self_child): Option<&T::Pointee> =
+                        (unsafe { self.branches.values.get(idx).as_ref() })
+                    else {
+                        continue;
+                    };
+                    let Some(clone_child) = (unsafe {
+                        clone
+                            .branches
+                            .values
+                            .get(idx)
+                            .cast::<<T::Pointee as Lend>::Lended<'_>>()
+                            .as_ref()
+                    }) else {
+                        continue;
+                    };
+                    unsafe { Consign::consign(self_child, clone_child) };
+                }
+            }
             return;
         }
 
@@ -343,13 +350,13 @@ impl<T, A: Allocator + Clone> Node<T, A> {
                     next_full_length
                 };
                 let idx = i as u8;
-                let clone_child = unsafe { clone.branches.nodes.get(idx).unwrap().as_ref() };
+                let clone_child = unsafe { clone.branches.nodes.get(idx).as_ref().unwrap() };
                 unsafe {
                     self.branches
                         .nodes
                         .get(idx)
-                        .unwrap()
                         .as_ref()
+                        .unwrap()
                         .succeed_nodes(clone_child, next_length, depth - 1);
                 }
             }
@@ -384,16 +391,37 @@ impl<T, A: Allocator + Clone> Node<T, A> {
         'label: {
             let last_idx = branch_length;
             if depth == 0 {
+                for i in 0..branch_length {
+                    // TODO optimize loop condition
+                    if clone_owned_flags.get(i) {
+                        let idx = i as u8;
+                        let Some(self_child) = (unsafe { self.branches.values.get(idx).as_ref() })
+                        else {
+                            continue;
+                        };
+                        let Some(clone_child) = (unsafe {
+                            clone
+                                .branches
+                                .values
+                                .get(idx)
+                                .cast::<<T::Pointee as Lend>::Lended<'_>>()
+                                .as_ref()
+                        }) else {
+                            continue;
+                        };
+                        unsafe { Consign::consign(self_child, clone_child) };
+                    }
+                }
                 return;
             } else if last_length == 0 && clone_owned_flags.get(last_idx) {
                 let mut clone =
-                    unsafe { clone.branches.nodes.get(last_idx as u8).unwrap().as_ref() };
+                    unsafe { clone.branches.nodes.get(last_idx as u8).as_ref().unwrap() };
                 for _ in 0..(depth - 1) {
                     unsafe {
                         if !clone.owned_branches.get().as_ref().unwrap().get(0) {
                             break 'label;
                         }
-                        clone = clone.branches.nodes.get(0).unwrap().as_ref();
+                        clone = clone.branches.nodes.get(0).as_ref().unwrap();
                     }
                 }
                 unsafe { self_tail_substitute.succeed_nodes(clone, tail_length, 0) };
@@ -406,13 +434,13 @@ impl<T, A: Allocator + Clone> Node<T, A> {
             if new_borrower_flags.get(i) {
                 let next_length = next_full_length;
                 let idx = i as u8;
-                let clone_child = unsafe { clone.branches.nodes.get(idx).unwrap().as_ref() };
+                let clone_child = unsafe { clone.branches.nodes.get(idx).as_ref().unwrap() };
                 unsafe {
                     self.branches
                         .nodes
                         .get(idx)
-                        .unwrap()
                         .as_ref()
+                        .unwrap()
                         .succeed_nodes(clone_child, next_length, depth - 1);
                 }
             }
@@ -423,16 +451,16 @@ impl<T, A: Allocator + Clone> Node<T, A> {
                     .branches
                     .nodes
                     .get(last_branch_idx as u8)
-                    .unwrap()
                     .as_ref()
+                    .unwrap()
             };
             if last_length == 0 {
                 unsafe {
                     self.branches
                         .nodes
                         .get(last_branch_idx as u8)
-                        .unwrap()
                         .as_ref()
+                        .unwrap()
                         .succeed_nodes(clone_child, next_full_length, depth - 1);
                 }
             } else {
@@ -440,8 +468,8 @@ impl<T, A: Allocator + Clone> Node<T, A> {
                     self.branches
                         .nodes
                         .get(last_branch_idx as u8)
-                        .unwrap()
                         .as_ref()
+                        .unwrap()
                         .succeed_nodes_missing_self_tail(
                             clone_child,
                             last_length,
@@ -482,15 +510,36 @@ impl<T, A: Allocator + Clone> Node<T, A> {
         'label: {
             let last_idx = branch_length;
             if depth == 0 {
+                for i in 0..branch_length {
+                    // TODO optimize loop condition
+                    if clone_owned_flags.get(i) {
+                        let idx = i as u8;
+                        let Some(self_child) = (unsafe { self.branches.values.get(idx).as_ref() })
+                        else {
+                            continue;
+                        };
+                        let Some(clone_child) = (unsafe {
+                            clone
+                                .branches
+                                .values
+                                .get(idx)
+                                .cast::<<T::Pointee as Lend>::Lended<'_>>()
+                                .as_ref()
+                        }) else {
+                            continue;
+                        };
+                        unsafe { Consign::consign(self_child, clone_child) };
+                    }
+                }
                 return;
             } else if last_length == 0 && self_owned_flags.get(last_idx) {
-                let mut orig = unsafe { self.branches.nodes.get(last_idx as u8).unwrap().as_ref() };
+                let mut orig = unsafe { self.branches.nodes.get(last_idx as u8).as_ref().unwrap() };
                 for _ in 0..(depth - 1) {
                     unsafe {
                         if !orig.owned_branches.get().as_ref().unwrap().get(0) {
                             break 'label;
                         }
-                        orig = orig.branches.nodes.get(0).unwrap().as_ref();
+                        orig = orig.branches.nodes.get(0).as_ref().unwrap();
                     }
                 }
                 unsafe { orig.succeed_nodes(clone_tail_substitute, tail_length, 0) };
@@ -503,13 +552,13 @@ impl<T, A: Allocator + Clone> Node<T, A> {
             if new_borrower_flags.get(i) {
                 let next_length = next_full_length;
                 let idx = i as u8;
-                let clone_child = unsafe { clone.branches.nodes.get(idx).unwrap().as_ref() };
+                let clone_child = unsafe { clone.branches.nodes.get(idx).as_ref().unwrap() };
                 unsafe {
                     self.branches
                         .nodes
                         .get(idx)
-                        .unwrap()
                         .as_ref()
+                        .unwrap()
                         .succeed_nodes(clone_child, next_length, depth - 1);
                 }
             }
@@ -520,16 +569,16 @@ impl<T, A: Allocator + Clone> Node<T, A> {
                     .branches
                     .nodes
                     .get(last_branch_idx as u8)
-                    .unwrap()
                     .as_ref()
+                    .unwrap()
             };
             if last_length == 0 {
                 unsafe {
                     self.branches
                         .nodes
                         .get(last_branch_idx as u8)
-                        .unwrap()
                         .as_ref()
+                        .unwrap()
                         .succeed_nodes(clone_child, next_full_length, depth - 1);
                 }
             } else {
@@ -537,8 +586,8 @@ impl<T, A: Allocator + Clone> Node<T, A> {
                     self.branches
                         .nodes
                         .get(last_branch_idx as u8)
-                        .unwrap()
                         .as_ref()
+                        .unwrap()
                         .succeed_nodes_missing_clone_tail(
                             clone_child,
                             last_length,

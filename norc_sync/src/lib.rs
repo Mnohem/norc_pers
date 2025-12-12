@@ -9,7 +9,7 @@ use core::{
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
     task::Waker,
 };
-use norc_pers::borrow::{PartialClone, Succeed};
+use norc_pers::borrow::{Consign, Lend};
 cfg_if::cfg_if! {
     if #[cfg(feature = "allocator-api2")] {
         use allocator_api2::alloc::Allocator;
@@ -40,7 +40,7 @@ pub struct TransactionToken(usize);
 static TOKEN_ID: AtomicUsize = AtomicUsize::new(0);
 pub struct Transactor<'t, T, A = Global>
 where
-    T: 't + PartialClone + Succeed,
+    T: 't + Lend + Consign,
     A: Allocator + Send + Sync + Clone,
 {
     oldest: UnsafeCell<NonNull<Node<Arc<T, A>>>>,
@@ -53,21 +53,21 @@ where
 
 unsafe impl<'t, T, A> Send for Transactor<'t, T, A>
 where
-    T: 't + PartialClone + Succeed + Send + Sync,
+    T: 't + Lend + Consign + Send + Sync,
     A: Allocator + Send + Sync + Clone,
 {
 }
 
 unsafe impl<T, A> Sync for Transactor<'_, T, A>
 where
-    T: PartialClone + Succeed + Send + Sync,
+    T: Lend + Consign + Send + Sync,
     A: Allocator + Send + Sync + Clone,
 {
 }
 
 impl<'t, T, A> Drop for Transactor<'t, T, A>
 where
-    T: 't + PartialClone + Succeed,
+    T: 't + Lend + Consign,
     A: Allocator + Send + Sync + Clone,
 {
     fn drop(&mut self) {
@@ -103,7 +103,7 @@ where
 }
 impl<'t, T, A> Transactor<'t, T, A>
 where
-    T: 't + PartialClone + Succeed,
+    T: 't + Lend + Consign,
     A: 't + Allocator + Clone + Send + Sync + Default,
 {
     pub fn new(item: T) -> (Self, TransactionToken) {
@@ -112,7 +112,7 @@ where
 }
 impl<'t, T, A> Transactor<'t, T, A>
 where
-    T: 't + PartialClone + Succeed,
+    T: 't + Lend + Consign,
     A: 't + Allocator + Clone + Send + Sync,
 {
     pub fn new_in(item: T, allocator: A) -> (Self, TransactionToken) {
@@ -143,9 +143,9 @@ where
         let mut oldest = unsafe { *self.oldest.get() };
         let second_oldest = (*unsafe { oldest.as_mut() }.newer.get_mut())?;
         unsafe {
-            oldest.as_ref().data.succeed(
+            oldest.as_ref().data.consign(
                 &second_oldest
-                    .cast::<Node<Arc<T::Cloned<'_>, A>>>()
+                    .cast::<Node<Arc<T::Lended<'_>, A>>>()
                     .as_ref()
                     .data,
             );
@@ -189,10 +189,10 @@ where
         f: F,
     ) -> Option<*mut Node<Arc<T, A>>>
     where
-        F: for<'a> Fn(&'a T) -> T::Cloned<'a>,
+        F: for<'a> Fn(&'a T) -> T::Lended<'a>,
     {
         let new_value = unsafe {
-            PartialClone::extend_inner_lifetime(f(newest.as_ref().unwrap_unchecked().data.deref()))
+            Lend::extend_inner_lifetime(f(newest.as_ref().unwrap_unchecked().data.deref()))
         };
 
         let to_be_newest_node: *mut Node<Arc<T, A>> = Box::into_raw_with_allocator(Box::new_in(
@@ -221,10 +221,10 @@ where
     }
     fn inner_set_commit<F>(&self, newest: *mut Node<Arc<T, A>>, f: F)
     where
-        F: for<'a> Fn(&'a T) -> T::Cloned<'a>,
+        F: for<'a> Fn(&'a T) -> T::Lended<'a>,
     {
         let new_value = unsafe {
-            PartialClone::extend_inner_lifetime(f(newest.as_ref().unwrap_unchecked().data.deref()))
+            Lend::extend_inner_lifetime(f(newest.as_ref().unwrap_unchecked().data.deref()))
         };
 
         let to_be_newest_node: *mut Node<Arc<T, A>> = Box::into_raw_with_allocator(Box::new_in(
@@ -242,7 +242,7 @@ where
         self.wake_wakers();
     }
 
-    pub fn alter<F: for<'a> Fn(&'a T) -> T::Cloned<'a>>(
+    pub fn alter<F: for<'a> Fn(&'a T) -> T::Lended<'a>>(
         &'t self,
         f: F,
     ) -> Transaction<'t, T, A, F> {
@@ -289,7 +289,7 @@ where
 }
 pub struct Subscriber<'t, T, A>
 where
-    T: 't + PartialClone + Succeed,
+    T: 't + Lend + Consign,
     A: Allocator + Send + Sync + Clone + 't,
 {
     init: Option<Arc<T, A>>,
@@ -297,7 +297,7 @@ where
 }
 impl<'t, T, A> Future for Subscriber<'t, T, A>
 where
-    T: 't + PartialClone + Succeed,
+    T: 't + Lend + Consign,
     A: Allocator + Send + Sync + Clone + 't,
 {
     type Output = Arc<T, A>;
@@ -323,9 +323,9 @@ where
 
 pub struct Transaction<'t, T, A, F>
 where
-    T: 't + PartialClone + Succeed,
+    T: 't + Lend + Consign,
     A: Allocator + Send + Sync + Clone + 't,
-    F: for<'a> Fn(&'a T) -> T::Cloned<'a>,
+    F: for<'a> Fn(&'a T) -> T::Lended<'a>,
 {
     transactor: &'t Transactor<'t, T, A>,
     action: F,
@@ -334,13 +334,13 @@ where
 
 impl<'t, T, A, F> Transaction<'t, T, A, F>
 where
-    T: 't + PartialClone + Succeed,
+    T: 't + Lend + Consign,
     A: Allocator + Send + Sync + Clone + 't,
-    F: for<'a> Fn(&'a T) -> T::Cloned<'a>,
+    F: for<'a> Fn(&'a T) -> T::Lended<'a>,
 {
     pub fn commit_blocking(&self, token: &TransactionToken)
     where
-        T: 't + PartialClone + Succeed,
+        T: 't + Lend + Consign,
     {
         let Transaction {
             transactor,
@@ -420,7 +420,7 @@ mod tests {
             Transactor::new(PersVec::new());
         for i in 0..100usize {
             transactor
-                .alter(|pv| pv.partial_clone().append(i))
+                .alter(|pv| pv.lend().append(i))
                 .commit_blocking(&token);
         }
         transactor.clear_history(&mut token);
@@ -440,14 +440,14 @@ mod tests {
             s.spawn(|| {
                 for i in 0..100usize {
                     transactor
-                        .alter(|pv| pv.partial_clone().append(i))
+                        .alter(|pv| pv.lend().append(i))
                         .commit_blocking(&token);
                 }
             });
             s.spawn(|| {
                 for i in 100..200usize {
                     transactor
-                        .alter(|pv| pv.partial_clone().append(i))
+                        .alter(|pv| pv.lend().append(i))
                         .commit_blocking(&token);
                 }
             });
@@ -468,7 +468,7 @@ mod tests {
         let append_1000 = || {
             for _ in 0..1000usize {
                 transactor
-                    .alter(|pv| pv.partial_clone().append(*pv.last().unwrap_or(&0) + 1))
+                    .alter(|pv| pv.lend().append(*pv.last().unwrap_or(&0) + 1))
                     .commit_blocking(&token);
             }
         };
@@ -503,7 +503,7 @@ mod tests {
         let append_1000 = async {
             for _ in 0..1000usize {
                 transactor
-                    .alter(|pv| pv.partial_clone().append(*pv.last().unwrap_or(&0) + 1))
+                    .alter(|pv| pv.lend().append(*pv.last().unwrap_or(&0) + 1))
                     .commit(&token)
                     .await;
             }
