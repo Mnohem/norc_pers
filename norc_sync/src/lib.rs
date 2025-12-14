@@ -192,7 +192,7 @@ where
         F: for<'a> Fn(&'a T) -> T::Lended<'a>,
     {
         let new_value = unsafe {
-            Lend::extend_inner_lifetime(f(newest.as_ref().unwrap_unchecked().data.deref()))
+            Consign::extend_inner_lifetime(f(newest.as_ref().unwrap_unchecked().data.deref()))
         };
 
         let to_be_newest_node: *mut Node<Arc<T, A>> = Box::into_raw_with_allocator(Box::new_in(
@@ -224,7 +224,7 @@ where
         F: for<'a> Fn(&'a T) -> T::Lended<'a>,
     {
         let new_value = unsafe {
-            Lend::extend_inner_lifetime(f(newest.as_ref().unwrap_unchecked().data.deref()))
+            Consign::extend_inner_lifetime(f(newest.as_ref().unwrap_unchecked().data.deref()))
         };
 
         let to_be_newest_node: *mut Node<Arc<T, A>> = Box::into_raw_with_allocator(Box::new_in(
