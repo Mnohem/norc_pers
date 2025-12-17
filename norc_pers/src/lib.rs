@@ -97,6 +97,13 @@ impl BitArray {
     pub const fn zeroes() -> Self {
         Self([0; _])
     }
+    pub fn set_bits_up_to(idx: usize) -> Self {
+        let mut result = Self::zeroes();
+        for i in 0..idx {
+            result.set(i);
+        }
+        result
+    }
     pub fn get(&self, idx: usize) -> bool {
         assert!(idx < BRANCH_FACTOR);
         let byte_idx = idx / 8;
@@ -143,6 +150,13 @@ impl BitArray {
         let mut result = Self::zeroes();
         for i in 0..bytes(BRANCH_FACTOR) {
             result.0[i] = self.0[i] & other.0[i];
+        }
+        result
+    }
+    pub fn count_bits(self) -> u32 {
+        let mut result = 0;
+        for i in 0..bytes(BRANCH_FACTOR) {
+            result += self.0[i].count_ones();
         }
         result
     }
