@@ -190,14 +190,23 @@ where
     }
 
     /// Clears the oldest value from the history and returns
-    /// Returns `None` if the history only contains one value or if values are simultaneously being
-    /// cleared elsewhere
+    /// Returns `None` if the history only contains one value
     pub fn take_oldest(&mut self) -> Option<Arc<T, A>> {
         if let Some(data) = self.inner_release_oldest() {
             *self.len.get_mut() -= 1;
             Some(data)
         } else {
             None
+        }
+    }
+    /// Clears the all but the newest value from the history
+    pub fn clear_oldest(&mut self, to_drop: usize) {
+        for _ in 0..to_drop {
+            if self.inner_release_oldest().is_some() {
+                *self.len.get_mut() -= 1;
+            } else {
+                return;
+            }
         }
     }
     /// Clears all but the newest value from the history
@@ -212,15 +221,18 @@ where
             newest = newest_alloc.older as *mut _;
         }
     }
-    #[must_use]
-    pub fn revert(&mut self, steps_back: usize) -> bool {
+    /// Reverts the history back to `steps_back` transactions ago.
+    /// Returns the length after this operation, unchanged in `Err` if the requested reversion was too large
+    /// (`steps_back >= self.len()`), otherwise the new length in `Ok`
+    pub fn revert(&mut self, steps_back: usize) -> Result<NonZeroUsize, NonZeroUsize> {
         let Some(new_root) = self.node_at(steps_back) else {
-            return false;
+            return Err(self.len());
         };
         unsafe { (*new_root).newer.get().write(None) };
         let old_root = self.newest.swap(new_root as *mut _, Ordering::Relaxed);
         self.inner_release_from_newest(old_root, steps_back);
-        true
+        *self.len.get_mut() -= steps_back;
+        Ok(unsafe { NonZeroUsize::new_unchecked(*self.len.get_mut()) })
     }
 
     /// Returns `None` if we were able to alter the value, `Some` if we saw the address change
@@ -263,7 +275,6 @@ where
         }
     }
 
-    #[must_use]
     pub fn alter<F: for<'a> Fn(&'a T) -> T::Lended<'a>>(
         &'t self,
         f: F,
@@ -273,7 +284,6 @@ where
             action: f,
         }
     }
-    #[must_use]
     pub fn subscriber(&'t self) -> Subscriber<'t, T, A> {
         Subscriber {
             init: None,
@@ -309,6 +319,7 @@ where
         }
     }
 }
+#[must_use = "A Subscriber does nothing unless polled"]
 pub struct Subscriber<'t, T, A>
 where
     T: 't + Lend + Consign,
@@ -343,6 +354,7 @@ where
     }
 }
 
+#[must_use = "A Transaction does nothing unless committed"]
 pub struct Transaction<'t, T, A, F>
 where
     T: 't + Lend + Consign,
@@ -427,6 +439,7 @@ mod tests {
     #[test]
     fn many_values_revert() {
         let mut history: History<PersVec<usize>> = History::new(PersVec::new());
+        assert_eq!(history.len().get(), 1);
         for i in 0..100 {
             history.alter(|pv| pv.lend().append(i)).commit_blocking();
         }
@@ -434,13 +447,16 @@ mod tests {
             assert_eq!(history.snapshot(i).unwrap().len(), 100 - i);
         }
         let snapshot50 = history.snapshot(50).unwrap();
-        assert!(history.revert(50));
+        assert_eq!(history.len().get(), 101);
+        assert!(history.revert(50).is_ok());
+        assert_eq!(history.len().get(), 51);
         assert!(Arc::ptr_eq(&history.latest(), &snapshot50));
 
         assert_eq!(snapshot50.iter().sum::<usize>(), (49 * 50) / 2);
         for i in 0..50 {
             history.alter(|pv| pv.lend().append(i)).commit_blocking();
         }
+        assert_eq!(history.len().get(), 101);
         assert_eq!(history.latest().iter().sum::<usize>(), 49 * 50);
     }
     #[test]
