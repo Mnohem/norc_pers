@@ -5,10 +5,8 @@ use core::{
     cell::UnsafeCell,
     marker::PhantomData,
     num::NonZeroUsize,
-    ops::Deref,
-    ptr::NonNull,
-    sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
-    task::Waker,
+    ptr::{self, NonNull},
+    sync::atomic::{AtomicPtr, Ordering},
 };
 use norc_pers::borrow::{Consign, Lend};
 cfg_if::cfg_if! {
@@ -16,25 +14,40 @@ cfg_if::cfg_if! {
         use allocator_api2::alloc::Allocator;
         use allocator_api2::boxed::Box;
         use allocator_api2::alloc::Global;
-        use allocator_api2::sync::Arc;
     } else {
         extern crate alloc as mem;
         use mem::alloc::Allocator;
         use mem::boxed::Box;
         use mem::alloc::Global;
-        use mem::sync::Arc;
     }
 }
 
-struct Node<T> {
-    newer: UnsafeCell<Option<NonNull<Node<T>>>>,
-    older: *const Node<T>,
-    data: T,
+#[derive(Clone, Copy, PartialEq, PartialOrd, Eq, Ord, Debug, Hash)]
+pub struct Timestamp(NonZeroUsize);
+impl Timestamp {
+    pub fn next(self, n: usize) -> Option<Timestamp> {
+        Some(Timestamp(self.0.checked_add(n)?))
+    }
+    pub fn previous(self, n: usize) -> Option<Timestamp> {
+        Some(Timestamp(NonZeroUsize::new(self.0.get() - n)?))
+    }
+    pub fn delta(self, other: Self) -> usize {
+        if self > other {
+            self.0.get() - other.0.get()
+        } else {
+            other.0.get() - self.0.get()
+        }
+    }
 }
 
-struct WakerNode {
-    older: *mut WakerNode,
-    waker: Waker,
+pub struct Entry<T> {
+    pub stamp: Timestamp,
+    pub item: T,
+}
+struct Node<T> {
+    newer: AtomicPtr<Node<T>>,
+    older: *const Node<T>,
+    entry: Entry<T>,
 }
 
 pub struct History<'t, T, A = Global>
@@ -42,10 +55,8 @@ where
     T: 't + Lend + Consign,
     A: Allocator + Send + Sync + Clone,
 {
-    len: AtomicUsize, // basically how many successful transactions
-    oldest: UnsafeCell<NonNull<Node<Arc<T, A>>>>,
-    newest: AtomicPtr<Node<Arc<T, A>>>,
-    wakers: AtomicPtr<WakerNode>,
+    oldest: UnsafeCell<NonNull<Node<T>>>,
+    newest: AtomicPtr<Node<T>>,
     _inner_lifetime: PhantomData<&'t T>,
     allocator: A,
 }
@@ -72,37 +83,21 @@ where
     fn drop(&mut self) {
         let Node {
             newer: mut node,
-            mut data,
+            mut entry,
             ..
         } = Box::into_inner(unsafe {
             Box::from_raw_in(self.oldest.get_mut().as_ptr(), self.allocator.clone())
         });
-        while node.get_mut().is_some() {
+        while !node.get_mut().is_null() {
             Node {
                 newer: node,
-                data,
+                entry,
                 ..
             } = Box::into_inner(unsafe {
-                Box::from_raw_in(
-                    node.get_mut().unwrap_unchecked().as_ptr(),
-                    self.allocator.clone(),
-                )
+                Box::from_raw_in(*node.get_mut(), self.allocator.clone())
             });
         }
-        drop(data);
-        if let Some(wakers) = NonNull::new(*self.wakers.get_mut()) {
-            let WakerNode {
-                mut older,
-                mut waker,
-            } = Box::into_inner(unsafe {
-                Box::from_raw_in(wakers.as_ptr(), self.allocator.clone())
-            });
-            while !older.is_null() {
-                WakerNode { older, waker } =
-                    Box::into_inner(unsafe { Box::from_raw_in(older, self.allocator.clone()) });
-            }
-            drop(waker);
-        }
+        drop(entry);
     }
 }
 impl<'t, T, A> History<'t, T, A>
@@ -120,138 +115,74 @@ where
     T: 't + Lend + Consign,
     A: 't + Allocator + Clone + Send + Sync,
 {
-    #[must_use]
-    pub fn new_in(item: T, allocator: A) -> Self {
-        let first = Box::into_raw_with_allocator(Box::new_in(
-            Node {
-                data: Arc::new_in(item, allocator.clone()),
-                newer: UnsafeCell::new(None),
-                older: core::ptr::null(),
-            },
-            allocator.clone(),
-        ))
-        .0;
-        Self {
-            len: AtomicUsize::new(1),
-            oldest: unsafe { NonNull::new(first).unwrap_unchecked() }.into(),
-            newest: AtomicPtr::new(first),
-            wakers: AtomicPtr::new(core::ptr::null_mut()),
-            _inner_lifetime: PhantomData,
-            allocator,
-        }
-    }
-    /// Returns the amount of values currently recorded.
-    /// `History` can never be empty, so we return a `NonZeroUsize`
-    #[must_use]
-    pub fn len(&self) -> NonZeroUsize {
-        unsafe { NonZeroUsize::new_unchecked(self.len.load(Ordering::Acquire)) }
-    }
-
-    fn node_at(&self, relative_age: usize) -> Option<*const Node<Arc<T, A>>> {
-        if self.len().get() <= relative_age {
+    fn node_at_time(&self, ts: Timestamp) -> Option<*const Node<T>> {
+        let latest = self.newest.load(Ordering::Relaxed);
+        let earliest = unsafe { (*self.oldest.get()).as_ptr() };
+        let latest_ts = unsafe { (*latest).entry.stamp };
+        let earliest_ts = unsafe { (*earliest).entry.stamp };
+        if ts > latest_ts || ts < earliest_ts {
             return None;
         }
-        let mut node = self.newest.load(Ordering::Acquire) as *const Node<Arc<T, A>>;
-        for _ in 0..relative_age {
-            node = unsafe { (*node).older };
+        let offset_from_earliest = ts.0.get() - earliest_ts.0.get();
+        let total_offset = latest_ts.0.get() - earliest_ts.0.get();
+        let mut node;
+        if offset_from_earliest >= total_offset / 2 {
+            let offset_from_latest = latest_ts.0.get() - ts.0.get();
+            node = latest;
+            for _ in 0..offset_from_latest {
+                node = unsafe { (*node).older } as *mut _;
+            }
+        } else {
+            node = earliest;
+            for _ in 0..offset_from_earliest {
+                node = unsafe { (*node).newer.load(Ordering::Relaxed) };
+            }
         }
         Some(node)
     }
 
-    #[must_use]
-    pub fn snapshot(&self, relative_age: usize) -> Option<Arc<T, A>> {
-        let node = self.node_at(relative_age)?;
-        Some(Arc::clone(unsafe { &(*node).data }))
-    }
-    #[must_use]
-    pub fn latest(&self) -> Arc<T, A> {
-        unsafe { self.snapshot(0).unwrap_unchecked() }
-    }
-    #[must_use]
-    pub fn previous(&self) -> Option<Arc<T, A>> {
-        self.snapshot(1)
-    }
     // Returns the oldest snapshot released from the history,
     // or `None` if there is nothing to free
-    fn inner_release_oldest(&self) -> Option<Arc<T, A>> {
-        let mut oldest = unsafe { *self.oldest.get() };
-        let second_oldest = (*unsafe { oldest.as_mut() }.newer.get_mut())?;
+    fn inner_release_oldest(&self) -> Option<Box<Node<T>, A>> {
+        let oldest = unsafe { *self.oldest.get() };
+        let second_oldest =
+            NonNull::new(unsafe { (*oldest.as_ptr()).newer.load(Ordering::Acquire) })?;
         unsafe {
-            oldest.as_ref().data.consign(
+            oldest.as_ref().entry.item.consign(
                 &second_oldest
-                    .cast::<Node<Arc<T::Lended<'_>, A>>>()
+                    .cast::<Node<T::Lended<'_>>>()
                     .as_ref()
-                    .data,
+                    .entry
+                    .item,
             );
             self.oldest.get().write(second_oldest);
         };
         let oldest_alloc = unsafe { Box::from_raw_in(oldest.as_ptr(), self.allocator.clone()) };
-        Some(oldest_alloc.data)
+        Some(oldest_alloc)
     }
 
-    /// Clears the oldest value from the history and returns
-    /// Returns `None` if the history only contains one value
-    pub fn take_oldest(&mut self) -> Option<Arc<T, A>> {
-        if let Some(data) = self.inner_release_oldest() {
-            *self.len.get_mut() -= 1;
-            Some(data)
-        } else {
-            None
-        }
-    }
-    /// Clears the all but the newest value from the history
-    pub fn clear_oldest(&mut self, to_drop: usize) {
-        for _ in 0..to_drop {
-            if self.inner_release_oldest().is_some() {
-                *self.len.get_mut() -= 1;
-            } else {
-                return;
-            }
-        }
-    }
-    /// Clears all but the newest value from the history
-    pub fn clear_history(&mut self) {
-        while self.inner_release_oldest().is_some() {}
-        *self.len.get_mut() = 1;
-    }
-
-    fn inner_release_from_newest(&mut self, mut newest: *mut Node<Arc<T, A>>, to_release: usize) {
-        for _ in 0..to_release {
-            let newest_alloc = unsafe { Box::from_raw_in(newest, self.allocator.clone()) };
-            newest = newest_alloc.older as *mut _;
-        }
-    }
-    /// Reverts the history back to `steps_back` transactions ago.
-    /// Returns the length after this operation, unchanged in `Err` if the requested reversion was too large
-    /// (`steps_back >= self.len()`), otherwise the new length in `Ok`
-    pub fn revert(&mut self, steps_back: usize) -> Result<NonZeroUsize, NonZeroUsize> {
-        let Some(new_root) = self.node_at(steps_back) else {
-            return Err(self.len());
-        };
-        unsafe { (*new_root).newer.get().write(None) };
-        let old_root = self.newest.swap(new_root as *mut _, Ordering::Relaxed);
-        self.inner_release_from_newest(old_root, steps_back);
-        *self.len.get_mut() -= steps_back;
-        Ok(unsafe { NonZeroUsize::new_unchecked(*self.len.get_mut()) })
-    }
-
-    /// Returns `None` if we were able to alter the value, `Some` if we saw the address change
+    // Returns `None` if we were unable to alter the value, `Some` if we could
     fn inner_optional_commit_loop<F>(
         &self,
-        newest: *mut Node<Arc<T, A>>,
         f: F,
-    ) -> Option<*mut Node<Arc<T, A>>>
+        newest: *mut Node<T>,
+    ) -> Result<Timestamp, Option<*mut Node<T>>>
     where
         F: for<'a> Fn(&'a T) -> T::Lended<'a>,
     {
-        let new_value = unsafe {
-            Consign::extend_inner_lifetime(f(newest.as_ref().unwrap_unchecked().data.deref()))
+        let Some(to_be_newest_stamp) = unsafe { (*newest).entry.stamp }.next(1) else {
+            return Err(None);
         };
-
-        let to_be_newest_node: *mut Node<Arc<T, A>> = Box::into_raw_with_allocator(Box::new_in(
+        let new_value = unsafe {
+            Consign::extend_inner_lifetime(f(&newest.as_ref().unwrap_unchecked().entry.item))
+        };
+        let to_be_newest_node: *mut Node<T> = Box::into_raw_with_allocator(Box::new_in(
             Node {
-                data: Arc::new_in(new_value, self.allocator.clone()),
-                newer: UnsafeCell::new(None),
+                entry: Entry {
+                    stamp: to_be_newest_stamp,
+                    item: new_value,
+                },
+                newer: AtomicPtr::new(ptr::null_mut()),
                 older: newest,
             },
             self.allocator.clone(),
@@ -264,137 +195,180 @@ where
             Ordering::Acquire,
         ) {
             unsafe { drop(Box::from_raw_in(to_be_newest_node, self.allocator.clone())) };
-            Some(other_ptr)
+            Err(Some(other_ptr))
         } else {
             unsafe {
-                (*newest).newer.get().write(NonNull::new(to_be_newest_node));
+                (*newest).newer.store(to_be_newest_node, Ordering::Release);
             };
-            self.len.fetch_add(1, Ordering::Release);
-            self.wake_wakers();
-            None
+            Ok(to_be_newest_stamp)
         }
     }
 
-    pub fn alter<F: for<'a> Fn(&'a T) -> T::Lended<'a>>(
-        &'t self,
-        f: F,
-    ) -> Transaction<'t, T, A, F> {
-        Transaction {
-            transactor: self,
-            action: f,
-        }
-    }
-    pub fn subscriber(&'t self) -> Subscriber<'t, T, A> {
-        Subscriber {
-            init: None,
-            transactor: self,
-        }
-    }
-    fn send_waker(&self, waker: Waker) {
-        let mut prev_waker = self.wakers.load(Ordering::Acquire);
-        let new_waker = Box::into_raw_with_allocator(Box::new_in(
-            WakerNode {
-                waker,
-                older: prev_waker,
+    #[must_use]
+    pub fn new_in(item: T, allocator: A) -> Self {
+        let first = Box::into_raw_with_allocator(Box::new_in(
+            Node {
+                entry: Entry {
+                    item,
+                    stamp: Timestamp(unsafe { NonZeroUsize::new_unchecked(1) }),
+                },
+                newer: AtomicPtr::new(ptr::null_mut()),
+                older: ptr::null(),
             },
-            self.allocator.clone(),
+            allocator.clone(),
         ))
         .0;
-        while let Err(other_waker) = self.wakers.compare_exchange_weak(
-            prev_waker,
-            new_waker,
-            Ordering::Release,
-            Ordering::Acquire,
-        ) {
-            prev_waker = other_waker;
-            unsafe { (&raw mut (*new_waker).older).write(other_waker) };
+        Self {
+            oldest: unsafe { NonNull::new(first).unwrap_unchecked() }.into(),
+            newest: AtomicPtr::new(first),
+            _inner_lifetime: PhantomData,
+            allocator,
         }
     }
-    fn wake_wakers(&self) {
-        let mut node = self.wakers.swap(core::ptr::null_mut(), Ordering::AcqRel);
-        while !node.is_null() {
-            let box_node = unsafe { Box::from_raw_in(node, self.allocator.clone()) };
-            box_node.waker.wake();
-            node = box_node.older;
+    /// Returns the amount of values currently recorded.
+    /// `History` can never be empty, so we return a `NonZeroUsize`
+    #[must_use]
+    pub fn len(&self) -> NonZeroUsize {
+        unsafe {
+            NonZeroUsize::new_unchecked(
+                ((*self.newest.load(Ordering::Acquire)).entry.stamp.0.get()
+                    - (*(*self.oldest.get()).as_ptr()).entry.stamp.0.get())
+                    + 1,
+            )
         }
     }
-}
-#[must_use = "A Subscriber does nothing unless polled"]
-pub struct Subscriber<'t, T, A>
-where
-    T: 't + Lend + Consign,
-    A: Allocator + Send + Sync + Clone + 't,
-{
-    init: Option<Arc<T, A>>,
-    transactor: &'t History<'t, T, A>,
-}
-impl<'t, T, A> Future for Subscriber<'t, T, A>
-where
-    T: 't + Lend + Consign,
-    A: Allocator + Send + Sync + Clone + 't,
-{
-    type Output = Arc<T, A>;
-
-    fn poll(
-        mut self: core::pin::Pin<&mut Self>,
-        cx: &mut core::task::Context<'_>,
-    ) -> core::task::Poll<Self::Output> {
-        let snapshot = self.transactor.latest();
-        let Some(ref init) = self.init else {
-            self.init = Some(Arc::clone(&snapshot));
-            return core::task::Poll::Ready(snapshot);
-        };
-        if Arc::ptr_eq(init, &snapshot) {
-            self.transactor.send_waker(cx.waker().clone());
-            core::task::Poll::Pending
+    #[must_use]
+    pub fn snapshot(&self, ts: Timestamp) -> Option<&Entry<T>> {
+        let node = self.node_at_time(ts)?;
+        Some(unsafe { &(*node).entry })
+    }
+    #[must_use]
+    pub fn earliest(&self) -> &Entry<T> {
+        let node = unsafe { &*(*self.oldest.get()).as_ptr() };
+        &node.entry
+    }
+    #[must_use]
+    pub fn latest(&self) -> &Entry<T> {
+        let node = unsafe { &*self.newest.load(Ordering::Acquire) };
+        &node.entry
+    }
+    /// Returns all entries preceding the given timestamp in chronological order.
+    /// Even if the given timestamp is not contained in history, we still iterate over all prior
+    /// entries.
+    pub fn before(&self, ts: Timestamp) -> impl Iterator<Item = &Entry<T>> {
+        let mut node = Some(unsafe { (*self.oldest.get()).as_ref() });
+        core::iter::from_fn(move || {
+            let entry = &node?.entry;
+            if ts <= entry.stamp {
+                None
+            } else {
+                node = unsafe { node?.newer.load(Ordering::Relaxed).as_ref() };
+                Some(entry)
+            }
+        })
+    }
+    /// Returns all entries succeeding the given timestamp in chronological order.
+    /// If the given timestamp is not contained in history, we still iterate over all posterior
+    /// entries.
+    pub fn after(&self, ts: Timestamp) -> impl Iterator<Item = &Entry<T>> {
+        let mut node = if ts < self.earliest().stamp {
+            Some(unsafe { (*self.oldest.get()).as_ref() })
         } else {
-            self.init = Some(Arc::clone(&snapshot));
-            core::task::Poll::Ready(snapshot)
-        }
+            self.node_at_time(ts)
+                .and_then(|node| unsafe { node.as_ref()?.newer.load(Ordering::Relaxed).as_ref() })
+        };
+        core::iter::from_fn(move || {
+            let entry = &node?.entry;
+            node = unsafe { node?.newer.load(Ordering::Relaxed).as_ref() };
+            Some(entry)
+        })
     }
-}
 
-#[must_use = "A Transaction does nothing unless committed"]
-pub struct Transaction<'t, T, A, F>
-where
-    T: 't + Lend + Consign,
-    A: Allocator + Send + Sync + Clone + 't,
-    F: for<'a> Fn(&'a T) -> T::Lended<'a>,
-{
-    transactor: &'t History<'t, T, A>,
-    action: F,
-}
+    /// Clears the oldest value from the history and returns it
+    /// Returns `None` if the history only contains one value
+    pub fn take_earliest(&mut self) -> Option<Entry<T>> {
+        self.inner_release_oldest().map(|x| x.entry)
+    }
+    /// Clears all the history before a given timestamp
+    /// Returns the earliest timestamp in an `Err` variant if the given timestamp is not in the history
+    /// Attempts to clear the `n` oldest values from history
+    pub fn clear_to(&mut self, ts: Timestamp) -> Result<(), Timestamp> {
+        let latest = self.newest.load(Ordering::Relaxed);
+        let earliest = unsafe { (*self.oldest.get()).as_ptr() };
+        let latest_ts = unsafe { (*latest).entry.stamp };
+        let earliest_ts = unsafe { (*earliest).entry.stamp };
+        if ts > latest_ts || ts < earliest_ts {
+            return Err(earliest_ts);
+        }
+        let offset_from_earliest = ts.0.get() - earliest_ts.0.get();
+        let mut prev = earliest;
+        let mut node = unsafe { *(*prev).newer.as_ptr() };
+        for _ in 0..offset_from_earliest {
+            unsafe {
+                prev.as_ref().unwrap_unchecked().entry.item.consign(
+                    &node
+                        .cast::<Node<T::Lended<'_>>>()
+                        .as_ref()
+                        .unwrap_unchecked()
+                        .entry
+                        .item,
+                );
+            }
+            unsafe { Box::from_raw_in(prev, self.allocator.clone()) };
+            prev = node;
+            node = unsafe { *(*prev).newer.as_ptr() };
+        }
+        unsafe { (&raw mut (*prev).older).write(ptr::null()) };
+        *self.oldest.get_mut() = unsafe { NonNull::new_unchecked(prev) };
+        Ok(())
+    }
+    /// Clears all but the newest value from history
+    pub fn clear_history(&mut self) {
+        while self.inner_release_oldest().is_some() {}
+    }
 
-impl<'t, T, A, F> Transaction<'t, T, A, F>
-where
-    T: 't + Lend + Consign,
-    A: Allocator + Send + Sync + Clone + 't,
-    F: for<'a> Fn(&'a T) -> T::Lended<'a>,
-{
-    pub fn commit_blocking(&self)
+    /// Reverts the history back to a given timestamp
+    /// Returns the latest timestamp in an `Err` variant if the timestamp is not in the history
+    pub fn revert_to(&mut self, ts: Timestamp) -> Result<(), Timestamp> {
+        let latest = self.newest.load(Ordering::Relaxed);
+        let earliest = unsafe { (*self.oldest.get()).as_ptr() };
+        let latest_ts = unsafe { (*latest).entry.stamp };
+        let earliest_ts = unsafe { (*earliest).entry.stamp };
+        if ts > latest_ts || ts < earliest_ts {
+            return Err(latest_ts);
+        }
+        let offset_from_latest = latest_ts.0.get() - ts.0.get();
+        let mut node = latest;
+        for _ in 0..offset_from_latest {
+            node = unsafe { Box::from_raw_in(node, self.allocator.clone()).older } as *mut _;
+        }
+        *self.newest.get_mut() = node;
+        Ok(())
+    }
+
+    pub fn commit_blocking<F>(&self, f: F) -> Timestamp
     where
-        T: 't + Lend + Consign,
+        F: for<'a> Fn(&'a T) -> T::Lended<'a>,
     {
-        let Transaction {
-            transactor, action, ..
-        } = self;
-        let mut newest = transactor.newest.load(Ordering::Acquire);
-        while let Some(other_ptr) = transactor.inner_optional_commit_loop(newest, action) {
-            newest = other_ptr;
+        let mut newest = self.newest.load(Ordering::Acquire);
+        loop {
+            match self.inner_optional_commit_loop(&f, newest) {
+                Ok(ts) => break ts,
+                Err(Some(other_ptr)) => newest = other_ptr,
+                Err(None) => newest = self.newest.load(Ordering::Acquire),
+            }
         }
     }
-    pub async fn commit(&self) {
-        let Transaction {
-            transactor, action, ..
-        } = self;
-        let mut newest = transactor.newest.load(Ordering::Acquire);
-        while self
-            .transactor
-            .inner_optional_commit_loop(newest, action)
-            .is_some()
-        {
+    pub async fn commit<F>(&self, f: F) -> Timestamp
+    where
+        F: for<'a> Fn(&'a T) -> T::Lended<'a>,
+    {
+        loop {
+            let newest = self.newest.load(Ordering::Acquire);
+            if let Ok(ts) = self.inner_optional_commit_loop(&f, newest) {
+                break ts;
+            }
             SelfWaker(false).await;
-            newest = transactor.newest.load(Ordering::Acquire);
         }
     }
 }
@@ -425,12 +399,12 @@ mod tests {
     fn singlethread_clear_history() {
         let mut history: History<PersVec<usize>> = History::new(PersVec::new());
         for i in 0..100usize {
-            history.alter(|pv| pv.lend().append(i)).commit_blocking();
+            history.commit_blocking(|pv| pv.lend().append(i));
         }
         history.clear_history();
-        assert_eq!(history.latest().len(), 100);
+        assert_eq!(history.latest().item.len(), 100);
         let mut sum = 0;
-        for &i in history.latest().iter() {
+        for &i in history.latest().item.iter() {
             assert!(i < 100);
             sum += i;
         }
@@ -440,44 +414,82 @@ mod tests {
     fn many_values_revert() {
         let mut history: History<PersVec<usize>> = History::new(PersVec::new());
         assert_eq!(history.len().get(), 1);
+        let origin = history.earliest().stamp;
         for i in 0..100 {
-            history.alter(|pv| pv.lend().append(i)).commit_blocking();
+            history.commit_blocking(|pv| pv.lend().append(i));
         }
         for i in 0..=100 {
-            assert_eq!(history.snapshot(i).unwrap().len(), 100 - i);
+            assert_eq!(
+                history
+                    .snapshot(origin.next(i).unwrap())
+                    .unwrap()
+                    .item
+                    .len(),
+                i
+            );
         }
-        let snapshot50 = history.snapshot(50).unwrap();
+        let stamp = history.latest().stamp.previous(50).unwrap();
+        let stamp50 = history.snapshot(stamp).unwrap().stamp;
         assert_eq!(history.len().get(), 101);
-        assert!(history.revert(50).is_ok());
-        assert_eq!(history.len().get(), 51);
-        assert!(Arc::ptr_eq(&history.latest(), &snapshot50));
+        assert!(history.revert_to(stamp).is_ok());
 
-        assert_eq!(snapshot50.iter().sum::<usize>(), (49 * 50) / 2);
+        let snapshot50 = history.snapshot(stamp50).unwrap();
+        assert_eq!(history.len().get(), 51);
+        assert!(ptr::eq(&history.latest().item, &snapshot50.item));
+
+        assert_eq!(snapshot50.item.iter().sum::<usize>(), (49 * 50) / 2);
         for i in 0..50 {
-            history.alter(|pv| pv.lend().append(i)).commit_blocking();
+            history.commit_blocking(|pv| pv.lend().append(i));
         }
         assert_eq!(history.len().get(), 101);
-        assert_eq!(history.latest().iter().sum::<usize>(), 49 * 50);
+        assert!(
+            history
+                .clear_to(history.earliest().stamp.next(50).unwrap())
+                .is_ok()
+        );
+        assert_eq!(history.len().get(), 51);
+        assert_eq!(history.latest().item.iter().sum::<usize>(), 49 * 50);
     }
     #[test]
-    fn simple_multithread_clear_history() {
+    fn before_after_check() {
         let mut history: History<PersVec<usize>> = History::new(PersVec::new());
+        let origin = history.latest().stamp;
         scope(|s| {
             s.spawn(|| {
                 for i in 0..100usize {
-                    history.alter(|pv| pv.lend().append(i)).commit_blocking();
+                    history.commit_blocking(|pv| pv.lend().append(i));
                 }
             });
             s.spawn(|| {
                 for i in 100..200usize {
-                    history.alter(|pv| pv.lend().append(i)).commit_blocking();
+                    history.commit_blocking(|pv| pv.lend().append(i));
+                }
+            });
+            s.spawn(|| {
+                for entry in history.after(origin) {
+                    let mut zero_max = 0;
+                    let mut hundred_max = 100;
+                    entry.item.iter().for_each(|x| {
+                        if *x / 100 > 0 {
+                            if *x >= hundred_max {
+                                hundred_max = *x;
+                            } else {
+                                panic!("{x} should not be smaller than {hundred_max}");
+                            }
+                        } else if *x >= zero_max {
+                            zero_max = *x;
+                        } else {
+                            panic!("{x} should not be smaller than {zero_max}");
+                        }
+                    });
                 }
             });
         });
+        assert!(history.before(origin).next().is_none());
         history.clear_history();
-        assert_eq!(history.latest().len(), 200);
+        assert_eq!(history.latest().item.len(), 200);
         let mut sum = 0;
-        for &i in history.latest().iter() {
+        for &i in history.latest().item.iter() {
             println!("{i}");
             assert!(i < 200);
             sum += i;
@@ -489,13 +501,11 @@ mod tests {
         let history: History<PersVec<usize>> = History::new(PersVec::new());
         let append_1000 = || {
             for _ in 0..1000usize {
-                history
-                    .alter(|pv| pv.lend().append(*pv.last().unwrap_or(&0) + 1))
-                    .commit_blocking();
+                history.commit_blocking(|pv| pv.lend().append(*pv.last().unwrap_or(&0) + 1));
             }
         };
         let check_sum = || {
-            let s = history.latest();
+            let s = &history.latest().item;
             let expected_sum = if s.len() >= 2 {
                 s.len() * (s.len() + 1) / 2
             } else {
@@ -525,13 +535,12 @@ mod tests {
         let append_1000 = async {
             for _ in 0..1000usize {
                 history
-                    .alter(|pv| pv.lend().append(*pv.last().unwrap_or(&0) + 1))
-                    .commit()
+                    .commit(|pv| pv.lend().append(*pv.last().unwrap_or(&0) + 1))
                     .await;
             }
         };
         let check_sum = async {
-            let s = history.latest();
+            let s = &history.latest().item;
             let expected_sum = if s.len() >= 2 {
                 s.len() * (s.len() + 1) / 2
             } else {
