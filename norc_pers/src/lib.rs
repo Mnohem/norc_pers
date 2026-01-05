@@ -8,11 +8,9 @@
 #![cfg_attr(not(feature = "allocator-api2"), feature(allocator_api))]
 
 pub mod borrow;
-mod list;
 pub(crate) mod node;
 mod vector;
 
-pub use list::List;
 pub use vector::PersVec;
 
 pub use core::{ops::Deref, ptr::NonNull};
@@ -46,46 +44,6 @@ cfg_if::cfg_if! {
     }
 }
 
-#[derive(Debug, Clone)]
-enum Ref<'a, T: ?Sized> {
-    Boxed(Box<T>),
-    Borrowed(&'a T),
-}
-impl<'a, T: ?Sized> Ref<'a, T> {
-    // For when we know we are holding a reference to a value that isnt owned
-    fn ref_unchecked(self) -> &'a T {
-        match self {
-            Self::Boxed(_) => unreachable!(),
-            Self::Borrowed(t) => t,
-        }
-    }
-    // For when we know we are owning a value we want to mutate
-    fn mut_unchecked(&mut self) -> &mut T {
-        match self {
-            Self::Boxed(t) => t.as_mut(),
-            Self::Borrowed(_) => unreachable!(),
-        }
-    }
-}
-impl<'a, T: ?Sized> Deref for Ref<'a, T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Self::Boxed(bt) => bt.deref(),
-            Self::Borrowed(t) => t,
-        }
-    }
-}
-impl<'a, T> AsRef<T> for Ref<'a, T>
-where
-    T: ?Sized,
-    <Ref<'a, T> as Deref>::Target: AsRef<T>,
-{
-    fn as_ref(&self) -> &T {
-        self.deref()
-    }
-}
 const fn bytes(n: usize) -> usize {
     n.div_ceil(8)
 }

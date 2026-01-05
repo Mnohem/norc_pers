@@ -18,6 +18,7 @@ pub unsafe trait Lend {
     type Lended<'a>
     where
         Self: 'a;
+    #[must_use]
     fn lend<'c>(&'c self) -> Self::Lended<'c>;
 }
 /// This trait exists to facilitate memory reclamation with lended values. When you have
@@ -46,6 +47,7 @@ pub trait Consign: Lend {
     /// # Safety
     /// It is up to the caller to ensure that `lended` is valid for the resultant lifetime. Usually
     /// this function will be called after a consignment, where `Self` was the type of the lender.
+    #[must_use]
     unsafe fn extend_inner_lifetime<'c>(lended: Self::Lended<'c>) -> Self
     where
         Self: 'c;
