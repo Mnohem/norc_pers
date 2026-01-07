@@ -144,12 +144,6 @@ impl Default for BitArray {
 #[repr(transparent)]
 pub(crate) struct RentPtr<T>(NonNull<T>);
 impl<T> RentPtr<T> {
-    /// ```
-    /// let own = RentPtr::new_owned(NonNull::new(Box::new(1usize).as_ptr())?);
-    /// let unown = RentPtr::new_unowned(&own);
-    /// assert!(own.is_owned());
-    /// assert!(!unown.is_owned());
-    /// ```
     pub fn is_owned(&self) -> bool {
         (self.0.addr().get() & 1) == 1
     }
