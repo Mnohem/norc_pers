@@ -55,17 +55,17 @@ impl<T: WordAddress, A: Allocator + Clone> PersVec<'static, T, A> {
 impl<'a, T: WordAddress, A: Allocator + Clone> PersVec<'a, T, A> {
     ///```
     /// use norc_pers::PersVec;
-    /// for i in 4113..=65552 {
-    ///     assert_eq!(PersVec::<usize>::depth(i), 3);
+    /// for i in 32801..=1048608 {
+    ///     assert_eq!(3, PersVec::<usize>::depth(i));
     /// }
-    /// for i in 273..=4112 {
-    ///     assert_eq!(PersVec::<usize>::depth(i), 2);
+    /// for i in 1057..=32800 {
+    ///     assert_eq!(2, PersVec::<usize>::depth(i));
     /// }
-    /// for i in 33..=272 {
-    ///     assert_eq!(PersVec::<usize>::depth(i), 1);
+    /// for i in 65..=1056 {
+    ///     assert_eq!(1, PersVec::<usize>::depth(i));
     /// }
-    /// for i in 0..=32 {
-    ///     assert_eq!(PersVec::<usize>::depth(i), 0);
+    /// for i in 0..=64 {
+    ///     assert_eq!(0, PersVec::<usize>::depth(i));
     /// }
     ///```
     pub fn depth(length: usize) -> u32 {
@@ -100,7 +100,7 @@ impl<'a, T: WordAddress, A: Allocator + Clone> PersVec<'a, T, A> {
     }
     ///```compile_fail
     /// use norc_pers::PersVec;
-    /// let new: PersVec<char> = PersVec::new().append('c');
+    /// let new: PersVec<Box<char>> = PersVec::new().append(Box::new('c'));
     /// let first = new.get(0);
     /// let new = new.append('h');
     /// println!("{}", first.unwrap());

@@ -1,6 +1,3 @@
-#![feature(set_ptr_value)]
-#![feature(layout_for_ptr)]
-#![feature(unsize)]
 #![feature(box_into_inner)]
 #![feature(ptr_as_uninit)]
 #![feature(iter_array_chunks)]
@@ -8,11 +5,13 @@
 #![cfg_attr(not(feature = "allocator-api2"), feature(allocator_api))]
 
 pub mod borrow;
+mod champ;
 pub(crate) mod node;
 mod vector;
 
 pub use vector::PersVec;
 
+use core::num::NonZeroUsize;
 pub use core::{ops::Deref, ptr::NonNull};
 
 cfg_if::cfg_if! {
@@ -48,8 +47,8 @@ const fn bytes(n: usize) -> usize {
     n.div_ceil(8)
 }
 
-pub const BRANCH_FACTOR: usize = 16;
-#[derive(Clone, Copy)]
+pub const BRANCH_FACTOR: usize = 32;
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct BitArray([u8; bytes(BRANCH_FACTOR)]);
 impl BitArray {
     pub const fn zeroes() -> Self {
@@ -118,9 +117,79 @@ impl BitArray {
         }
         result
     }
+    pub fn count_bits_up_to(self, num: usize) -> u32 {
+        let mut result = 0;
+        let full_bytes_covered = num / 8;
+        for i in 0..full_bytes_covered {
+            result += self.0[i].count_ones();
+        }
+        let leftover_bits = (num % 8) as u8;
+        result
+            + self
+                .0
+                .get(full_bytes_covered)
+                .map(|x| (x >> (8 - leftover_bits)).count_ones())
+                .unwrap_or(0)
+    }
 }
 impl Default for BitArray {
     fn default() -> Self {
         Self::zeroes()
+    }
+}
+
+/// `align_of::<T>() >= 2`
+/// lsb is tag, set for owned, unset for unowned
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+pub(crate) struct RentPtr<T>(NonNull<T>);
+impl<T> RentPtr<T> {
+    /// ```
+    /// let own = RentPtr::new_owned(NonNull::new(Box::new(1usize).as_ptr())?);
+    /// let unown = RentPtr::new_unowned(&own);
+    /// assert!(own.is_owned());
+    /// assert!(!unown.is_owned());
+    /// ```
+    pub fn is_owned(&self) -> bool {
+        (self.0.addr().get() & 1) == 1
+    }
+    fn ptr(&self) -> NonNull<T> {
+        self.0
+            .map_addr(|x| unsafe { NonZeroUsize::new(x.get() & !1).unwrap_unchecked() })
+    }
+    pub fn as_ptr(&self) -> Option<NonNull<T>> {
+        if !self.is_owned() {
+            return None;
+        }
+        Some(self.ptr())
+    }
+    pub fn new_owned(ptr: NonNull<T>) -> Self {
+        RentPtr(ptr.map_addr(|x| x.saturating_add(1)))
+    }
+    pub fn new_unowned(ptr: &T) -> Self {
+        RentPtr(NonNull::from(ptr))
+    }
+    pub fn as_unowned(&self) -> Self {
+        RentPtr::new_unowned(unsafe { self.ptr().as_ref() })
+    }
+}
+impl<T> AsRef<T> for RentPtr<T> {
+    fn as_ref(&self) -> &T {
+        unsafe { self.ptr().as_ref() }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::BitArray;
+
+    #[test]
+    fn count_bits_up_to() {
+        let mut bits = BitArray::set_bits_up_to(3);
+        assert_eq!(3, bits.count_bits_up_to(3));
+        bits.unset(1);
+        assert_eq!(2, bits.count_bits_up_to(3));
+        bits.set(3);
+        assert_eq!(2, bits.count_bits_up_to(3));
     }
 }
